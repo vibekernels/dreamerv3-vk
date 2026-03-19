@@ -69,6 +69,23 @@ Checkpoints are saved to `--logdir` as `checkpoint_<steps>.pt`. Resume training:
 python train.py --device cuda --resume runs/slither/checkpoint_50000.pt
 ```
 
+## Human play
+
+You can play the game manually with keyboard controls:
+
+```bash
+pip install pygame
+python examples/human_play.py
+```
+
+| Key | Action |
+|-----|--------|
+| Left Arrow / A | Turn left |
+| Right Arrow / D | Turn right |
+| (no key) | Go straight |
+| R | Restart after death |
+| ESC / Q | Quit |
+
 ## Using the environment directly
 
 ```python
