@@ -1,0 +1,19 @@
+# DreamerV3 configuration for Slither-v0
+# Usage with danijar/dreamerv3:
+#   python dreamerv3/main.py --configs slither --run.script train
+#
+# Or with NM512/dreamerv3-torch:
+#   python train.py --env Slither-v0 --config examples/dreamerv3_config.yaml
+
+slither:
+  task: Slither-v0
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  run:
+    steps: 1e6
+    log_every: 1e4
+    train_ratio: 512
+  env:
+    amount: 4           # parallel envs
+    repeat: 2           # action repeat
+    length: 4000        # max episode length

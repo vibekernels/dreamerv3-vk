@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slither-gym"
+version = "0.1.0"
+description = "A slither.io clone as a Gymnasium environment for RL training"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "gymnasium>=0.29",
+]
+
+[project.optional-dependencies]
+render = ["pygame>=2.1"]
+dev = ["pytest"]
+
+[project.entry-points."gymnasium.envs.__root__"]
+SlitherGym = "slither_gym.registration"
+
+[tool.setuptools.packages.find]
+include = ["slither_gym*"]
