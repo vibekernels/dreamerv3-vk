@@ -83,14 +83,14 @@ python eval_stochastic.py
 
 ### Results (500K steps, RTX 4090)
 
-| Metric | Greedy Policy | Stochastic Policy |
-|---|---|---|
-| Mean Return | 18.49 | 19.24 |
-| Max Return | 45.00 | 74.00 |
-| Mean Episode Length | 2,007 | 2,039 |
-| Survival Rate (4000 steps) | 24.0% | 30.0% |
-| Food/episode | 15.2 | — |
-| Kills/episode | 0.36 | — |
+| Metric | Random | Greedy (trained) | Stochastic (trained) |
+|---|---|---|---|
+| Mean Return | 3.59 | 18.49 (5.2×) | 19.24 (5.4×) |
+| Max Return | 10.25 | 45.00 | 74.00 |
+| Mean Episode Length | 171 | 2,007 (11.7×) | 2,039 (11.9×) |
+| Survival Rate (4000 steps) | 0% | 24.0% | 30.0% |
+| Food/episode | — | 15.2 | — |
+| Kills/episode | — | 0.36 | — |
 
 Training takes ~15 hours on an RTX 4090 (~9 env steps/sec). GPU memory usage is ~2.2 GB.
 
