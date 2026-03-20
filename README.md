@@ -69,6 +69,31 @@ Checkpoints are saved to `--logdir` as `checkpoint_<steps>.pt`. Resume training:
 python train.py --device cuda --resume runs/slither/checkpoint_50000.pt
 ```
 
+## Evaluation
+
+Evaluate a trained checkpoint with greedy or stochastic policies:
+
+```bash
+# Greedy policy (deterministic action selection)
+python eval.py --checkpoint runs/slither/checkpoint_final.pt --episodes 50
+
+# Stochastic policy (samples from the learned distribution)
+python eval_stochastic.py
+```
+
+### Results (500K steps, RTX 4090)
+
+| Metric | Greedy Policy | Stochastic Policy |
+|---|---|---|
+| Mean Return | 18.49 | 19.24 |
+| Max Return | 45.00 | 74.00 |
+| Mean Episode Length | 2,007 | 2,039 |
+| Survival Rate (4000 steps) | 24.0% | 30.0% |
+| Food/episode | 15.2 | — |
+| Kills/episode | 0.36 | — |
+
+Training takes ~15 hours on an RTX 4090 (~9 env steps/sec). GPU memory usage is ~2.2 GB.
+
 ## Human play
 
 You can play the game manually with keyboard controls:

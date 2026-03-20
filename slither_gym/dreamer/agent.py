@@ -239,7 +239,7 @@ class DreamerV3Agent:
         # Flatten batch for imagination start states
         start_features = self.world_model.rssm.get_features(state).detach()
 
-        # Imagine forward
+        # Imagine forward — actor learns through differentiable world model dynamics
         imagined_features = [start_features]
         imagined_actions = []
         curr_state = {k: v.detach() for k, v in state.items()}
@@ -256,18 +256,20 @@ class DreamerV3Agent:
         features_stack = torch.stack(imagined_features, dim=1)  # (B, H+1, D)
         actions_stack = torch.stack(imagined_actions, dim=1)     # (B, H, A)
 
-        # Predict rewards and continues in imagination
-        feat_flat = features_stack[:, 1:].reshape(-1, features_stack.shape[-1])
-        reward_logits = self.world_model.reward_head(feat_flat)
-        imagined_rewards = symexp(twohot_decode(reward_logits, self.reward_bins))
-        imagined_rewards = imagined_rewards.reshape(B, self.imagine_horizon)
+        # Predict rewards and continues in imagination (no grad needed, used for targets only)
+        with torch.no_grad():
+            feat_flat = features_stack[:, 1:].reshape(-1, features_stack.shape[-1])
+            reward_logits = self.world_model.reward_head(feat_flat)
+            imagined_rewards = symexp(twohot_decode(reward_logits, self.reward_bins))
+            imagined_rewards = imagined_rewards.reshape(B, self.imagine_horizon)
 
-        cont_logits = self.world_model.continue_head(feat_flat).reshape(B, self.imagine_horizon)
-        imagined_conts = torch.sigmoid(cont_logits)
+            cont_logits = self.world_model.continue_head(feat_flat).reshape(B, self.imagine_horizon)
+            imagined_conts = torch.sigmoid(cont_logits)
 
-        # Critic values
-        values = self.critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
-        values = values.reshape(B, self.imagine_horizon + 1)
+        # Critic values (detach: values are only used for advantages, not differentiated)
+        with torch.no_grad():
+            values = self.critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
+            values = values.reshape(B, self.imagine_horizon + 1)
 
         slow_values = self.slow_critic.value(features_stack.reshape(-1, features_stack.shape[-1]).detach())
         slow_values = slow_values.reshape(B, self.imagine_horizon + 1)

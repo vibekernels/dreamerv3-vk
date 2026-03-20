@@ -164,7 +164,7 @@ def main():
         # DreamerV3 uses a high train ratio: many gradient steps per env step
         n_train = max(1, ep_len * args.train_ratio // (args.batch_size * args.seq_len))
 
-        for _ in range(n_train):
+        for i in range(n_train):
             batch = buffer.sample(args.batch_size)
             metrics = agent.train_step(batch)
             train_steps += 1
