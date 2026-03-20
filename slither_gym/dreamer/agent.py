@@ -128,6 +128,45 @@ class DreamerV3Agent:
 
         return action.argmax(-1).item()
 
+    @torch.no_grad()
+    def batch_act(self, obs_batch: np.ndarray, training: bool = True) -> np.ndarray:
+        """Select actions for a batch of observations. obs_batch: (N, H, W, 3) uint8.
+        Returns: (N,) int actions."""
+        N = obs_batch.shape[0]
+        if self._prev_state is None:
+            self.init_state(N)
+
+        obs_t = torch.from_numpy(obs_batch).float().permute(0, 3, 1, 2).to(self.device) / 255.0
+
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            embed = self.world_model.encoder(obs_t)
+
+        post_state, _, _ = self.world_model.rssm.observe_step(
+            self._prev_state, self._prev_action, embed.float()
+        )
+
+        features = self.world_model.rssm.get_features(post_state)
+        dist = self.actor(features)
+
+        if training:
+            action = dist.sample()
+        else:
+            action = F.one_hot(dist.logits.argmax(-1), self.action_dim).float()
+
+        self._prev_state = post_state
+        self._prev_action = action
+
+        return action.argmax(-1).cpu().numpy()
+
+    def reset_state_at(self, idx: int):
+        """Reset the RSSM state for a single env index (after episode boundary)."""
+        if self._prev_state is None:
+            return
+        init = self.world_model.rssm.initial_state(1, self.device)
+        for key in self._prev_state:
+            self._prev_state[key][idx] = init[key][0]
+        self._prev_action[idx] = 0.0
+
     def train_step(self, batch: dict[str, np.ndarray]) -> dict[str, float]:
         """One training step on a batch of sequences. Returns loss metrics."""
         # Convert to tensors
