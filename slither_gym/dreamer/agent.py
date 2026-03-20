@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from .networks import (
-    WorldModel, Actor, Critic,
+    WorldModel, Actor, Critic, RSSMState,
     symlog, symexp, twohot_encode, twohot_decode,
 )
 
@@ -41,6 +41,9 @@ class DreamerV3Agent:
         use_amp: bool = True,
         compile_models: bool = True,
     ):
+        # TF32 gives ~1.5x matmul speedup on Ampere+ GPUs with negligible precision loss
+        torch.set_float32_matmul_precision("high")
+
         self.device = torch.device(device)
         self.action_dim = action_dim
         self.imagine_horizon = imagine_horizon
@@ -80,6 +83,29 @@ class DreamerV3Agent:
                 self.world_model.decoder = torch.compile(self.world_model.decoder)
             except Exception:
                 pass  # fallback gracefully if compile fails
+
+        # Compiled RSSM step functions for use in training loops.
+        # Stored on the agent (not on the rssm module) to avoid shadowing the original bound
+        # methods, which would break torch.compile's guard system (__self__ lookup).
+        # act/batch_act continue to call rssm.observe_step directly (uncompiled, no threading risk).
+        rssm = self.world_model.rssm
+        if self.device.type == "cuda":
+            try:
+                # mode="default" uses Triton kernel fusion without CUDA graphs.
+                # CUDA graphs ("reduce-overhead") conflict with sequential RNN loops where
+                # each step's output is the next step's input — they alias output buffers
+                # across invocations, causing overwrites.
+                self._compiled_observe = torch.compile(rssm.observe_step, mode="default")
+                self._compiled_imagine = torch.compile(rssm.imagine_step, mode="default")
+            except Exception:
+                self._compiled_observe = rssm.observe_step
+                self._compiled_imagine = rssm.imagine_step
+        else:
+            self._compiled_observe = rssm.observe_step
+            self._compiled_imagine = rssm.imagine_step
+
+        # Cache for sharing embeddings between world-model and actor-critic training
+        self._train_embed_cache: torch.Tensor | None = None
 
         # Optimizers
         self.model_opt = torch.optim.Adam(self.world_model.parameters(), lr=lr_model, eps=1e-8)
@@ -163,17 +189,19 @@ class DreamerV3Agent:
         if self._prev_state is None:
             return
         init = self.world_model.rssm.initial_state(1, self.device)
-        for key in self._prev_state:
-            self._prev_state[key][idx] = init[key][0]
+        # NamedTuple is immutable, but the underlying tensors are mutable in-place
+        self._prev_state.deter[idx] = init.deter[0]
+        self._prev_state.stoch[idx] = init.stoch[0]
         self._prev_action[idx] = 0.0
 
     def train_step(self, batch: dict[str, np.ndarray]) -> dict[str, float]:
         """One training step on a batch of sequences. Returns loss metrics."""
-        # Convert to tensors
-        obs = torch.from_numpy(batch["obs"]).float().to(self.device) / 255.0  # (B, T, 3, 64, 64)
-        actions = torch.from_numpy(batch["action"]).float().to(self.device)     # (B, T, A)
-        rewards = torch.from_numpy(batch["reward"]).float().to(self.device)     # (B, T)
-        conts = torch.from_numpy(batch["cont"]).float().to(self.device)         # (B, T)
+        # Transfer obs as uint8 (4x smaller than float32) and cast on GPU.
+        # Remaining tensors are small enough that transfer cost is negligible.
+        obs = torch.from_numpy(batch["obs"]).to(self.device).float() / 255.0   # (B, T, 3, 64, 64)
+        actions = torch.from_numpy(batch["action"]).to(self.device)             # (B, T, A)
+        rewards = torch.from_numpy(batch["reward"]).to(self.device)             # (B, T)
+        conts = torch.from_numpy(batch["cont"]).to(self.device)                 # (B, T)
 
         B, T = obs.shape[:2]
 
@@ -199,12 +227,14 @@ class DreamerV3Agent:
 
         # Run RSSM forward (fp32 for recurrent stability)
         embed_f32 = embed.float()
+        # Cache detached embeddings for actor-critic (avoids a second encoder forward pass)
+        self._train_embed_cache = embed_f32.detach()
         prev_state = self.world_model.rssm.initial_state(B, self.device)
         posts, priors_logits = [], []
         features_list = []
 
         for t in range(T):
-            post_state, prior_state, prior_logits = self.world_model.rssm.observe_step(
+            post_state, prior_state, prior_logits = self._compiled_observe(
                 prev_state, actions[:, t], embed_f32[:, t]
             )
             features = self.world_model.rssm.get_features(post_state)
@@ -267,7 +297,7 @@ class DreamerV3Agent:
             ) if False else None
 
             # Use stored stochastic samples to compute KL
-            post_stoch = post_state["stoch"]  # (B, stoch_dim, class_size)
+            post_stoch = post_state.stoch  # (B, stoch_dim, class_size)
             post_probs = post_stoch  # already one-hot-ish from straight-through
             prior_probs = F.softmax(prior_logits, dim=-1)
 
@@ -283,16 +313,20 @@ class DreamerV3Agent:
 
     def _train_actor_critic(self, obs, actions, B, T):
         """Train actor and critic through imagination in the world model."""
-        # Get a starting state from the world model (detach from model graph)
+        # Get a starting state from the world model (detach from model graph).
+        # Reuse embeddings computed during world-model training to avoid a second encoder pass.
         with torch.no_grad():
-            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                obs_flat = obs.reshape(B * T, *obs.shape[2:])
-                embed_flat = self.world_model.encoder(obs_flat)
-            embed = embed_flat.float().reshape(B, T, -1)
+            if self._train_embed_cache is not None:
+                embed = self._train_embed_cache
+            else:
+                with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                    obs_flat = obs.reshape(B * T, *obs.shape[2:])
+                    embed_flat = self.world_model.encoder(obs_flat)
+                embed = embed_flat.float().reshape(B, T, -1)
 
             state = self.world_model.rssm.initial_state(B, self.device)
             for t in range(T):
-                state, _, _ = self.world_model.rssm.observe_step(state, actions[:, t], embed[:, t])
+                state, _, _ = self._compiled_observe(state, actions[:, t], embed[:, t])
 
         # Flatten batch for imagination start states
         start_features = self.world_model.rssm.get_features(state).detach()
@@ -300,7 +334,7 @@ class DreamerV3Agent:
         # Imagine forward — actor learns through differentiable world model dynamics
         imagined_features = [start_features]
         imagined_actions = []
-        curr_state = {k: v.detach() for k, v in state.items()}
+        curr_state = RSSMState(deter=state.deter.detach(), stoch=state.stoch.detach())
 
         for _ in range(self.imagine_horizon):
             features = self.world_model.rssm.get_features(curr_state)
@@ -308,7 +342,7 @@ class DreamerV3Agent:
             action = action_dist.sample()
             imagined_actions.append(action)
 
-            curr_state = self.world_model.rssm.imagine_step(curr_state, action)
+            curr_state = self._compiled_imagine(curr_state, action)
             imagined_features.append(self.world_model.rssm.get_features(curr_state))
 
         features_stack = torch.stack(imagined_features, dim=1)  # (B, H+1, D)

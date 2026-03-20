@@ -7,12 +7,19 @@ with symlog transforms and unimix categoricals per the DreamerV3 paper.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Independent, Normal, OneHotCategorical
+
+
+class RSSMState(NamedTuple):
+    """RSSM state as a NamedTuple for torch.compile compatibility."""
+    deter: torch.Tensor  # (B, deter_dim)
+    stoch: torch.Tensor  # (B, stoch_dim, class_size)
 
 
 # ---------------------------------------------------------------------------
@@ -168,52 +175,58 @@ class RSSM(nn.Module):
         """Total feature dimension: deter + stoch_flat."""
         return self.deter_dim + self.stoch_dim * self.class_size
 
-    def initial_state(self, batch_size: int, device: torch.device):
-        return {
-            "deter": torch.zeros(batch_size, self.deter_dim, device=device),
-            "stoch": torch.zeros(batch_size, self.stoch_dim, self.class_size, device=device),
-        }
+    def initial_state(self, batch_size: int, device: torch.device) -> RSSMState:
+        return RSSMState(
+            deter=torch.zeros(batch_size, self.deter_dim, device=device),
+            stoch=torch.zeros(batch_size, self.stoch_dim, self.class_size, device=device),
+        )
 
-    def get_features(self, state: dict) -> torch.Tensor:
-        stoch_flat = state["stoch"].reshape(state["stoch"].shape[0], -1)
-        return torch.cat([state["deter"], stoch_flat], dim=-1)
+    def get_features(self, state: RSSMState) -> torch.Tensor:
+        stoch_flat = state.stoch.reshape(state.stoch.shape[0], -1)
+        return torch.cat([state.deter, stoch_flat], dim=-1)
 
     def _categorical(self, logits: torch.Tensor) -> torch.Tensor:
-        """Sample from categorical with straight-through and unimix."""
+        """Sample from categorical with straight-through and unimix.
+
+        Uses the Gumbel-max trick instead of OneHotCategorical.sample() to avoid
+        aten::multinomial, which is incompatible with CUDA graph capture.
+        Produces identical samples from the same distribution.
+        """
         logits = logits.reshape(-1, self.stoch_dim, self.class_size)
         # Uniform mix for exploration
         if self.unimix > 0:
             probs = F.softmax(logits, dim=-1)
             probs = (1 - self.unimix) * probs + self.unimix / self.class_size
             logits = torch.log(probs + 1e-8)
-        # Straight-through: sample but pass gradients through softmax
-        dist = OneHotCategorical(logits=logits)
-        sample = dist.sample()
+        # Gumbel-max trick: u ~ Uniform(0,1), gumbel = -log(-log(u))
+        u = torch.zeros_like(logits).uniform_().clamp_(1e-20, 1 - 1e-7)
+        gumbel = -(-u.log()).log()
+        sample = F.one_hot((logits + gumbel).argmax(-1), self.class_size).to(logits.dtype)
         # Straight-through estimator
         probs = F.softmax(logits, dim=-1)
         return sample + probs - probs.detach()
 
-    def observe_step(self, prev_state: dict, action: torch.Tensor, embed: torch.Tensor):
+    def observe_step(self, prev_state: RSSMState, action: torch.Tensor, embed: torch.Tensor):
         """One step of posterior (training). Returns prior and posterior states."""
         prior_state = self.imagine_step(prev_state, action)
-        h = prior_state["deter"]
+        h = prior_state.deter
 
         # Posterior
         post_logits = self.post_net(torch.cat([h, embed], dim=-1))
         post_stoch = self._categorical(post_logits)
-        post_state = {"deter": h, "stoch": post_stoch}
+        post_state = RSSMState(deter=h, stoch=post_stoch)
 
         return post_state, prior_state, post_logits.reshape(-1, self.stoch_dim, self.class_size)
 
-    def imagine_step(self, prev_state: dict, action: torch.Tensor):
+    def imagine_step(self, prev_state: RSSMState, action: torch.Tensor) -> RSSMState:
         """One step of prior (imagination). Returns prior state."""
-        stoch_flat = prev_state["stoch"].reshape(prev_state["stoch"].shape[0], -1)
+        stoch_flat = prev_state.stoch.reshape(prev_state.stoch.shape[0], -1)
         x = self.pre_gru(torch.cat([stoch_flat, action], dim=-1))
-        h = self.gru(x, prev_state["deter"])
+        h = self.gru(x, prev_state.deter)
 
         prior_logits = self.prior_net(h)
         prior_stoch = self._categorical(prior_logits)
-        return {"deter": h, "stoch": prior_stoch}
+        return RSSMState(deter=h, stoch=prior_stoch)
 
     def get_prior_logits(self, deter: torch.Tensor) -> torch.Tensor:
         return self.prior_net(deter).reshape(-1, self.stoch_dim, self.class_size)
