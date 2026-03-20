@@ -27,19 +27,80 @@ BOUNDARY_COLOR = np.array([180, 50, 50], dtype=np.uint8)
 
 
 class NumpyRenderer:
-    """Renders ego-centric observations as NumPy RGB arrays in slither.io style."""
+    """Renders ego-centric observations as NumPy RGB arrays in slither.io style.
+
+    All objects exist in world space with world-unit sizes. The renderer
+    converts positions and radii to pixel space through a single viewport
+    transform, so zooming in/out uniformly scales everything.
+    Anti-aliased circles are used for smooth edges.
+    """
 
     def __init__(self, config: GameConfig):
         self.config = config
         self.size = config.obs_size
-        self.vr = config.viewport_radius
+        self.half = config.obs_size / 2.0
+        self.base_vr = config.viewport_radius
 
-        # Pre-compute pixel coordinate grid (centered on 0,0)
-        half = self.size / 2
+        # Pre-compute normalised pixel coordinate grid [-1, 1]
         y_coords, x_coords = np.mgrid[0:self.size, 0:self.size]
-        # Map pixel coords to world-relative coords
-        self.px = (x_coords.astype(np.float32) - half + 0.5) / half * self.vr
-        self.py = (y_coords.astype(np.float32) - half + 0.5) / half * self.vr
+        self.px_norm = (x_coords.astype(np.float32) - self.half + 0.5) / self.half
+        self.py_norm = (y_coords.astype(np.float32) - self.half + 0.5) / self.half
+
+    # ── Coordinate helpers ──────────────────────────────────────────────
+
+    def _viewport_radius(self, snake) -> float:
+        """Viewport scales with log of snake length for camera zoom-out."""
+        ratio = snake.length / self.config.initial_length
+        scale = 1.0 + 0.4 * np.log(max(1.0, ratio))
+        return self.base_vr * scale
+
+    def _world_to_px_radius(self, world_radius: float, vr: float) -> float:
+        """Convert a world-space radius to a floating-point pixel radius."""
+        return world_radius / vr * self.half
+
+    # ── Anti-aliased circle drawing ─────────────────────────────────────
+
+    def _draw_circle(self, img: np.ndarray, x: float, y: float,
+                     r_px: float, color: np.ndarray):
+        """Draw an anti-aliased filled circle via alpha blending on edges."""
+        ri = int(np.ceil(r_px)) + 1
+        x0, x1 = max(0, int(x) - ri), min(self.size, int(x) + ri + 1)
+        y0, y1 = max(0, int(y) - ri), min(self.size, int(y) + ri + 1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+        # Alpha: 1 inside, smooth falloff at edge (1px transition)
+        alpha = np.clip(r_px - dist + 0.5, 0.0, 1.0).astype(np.float32)
+        mask = alpha > 0
+        if not np.any(mask):
+            return
+        region = img[y0:y1, x0:x1]
+        alpha_3 = alpha[:, :, np.newaxis]
+        blended = (region.astype(np.float32) * (1 - alpha_3)
+                   + color.astype(np.float32) * alpha_3)
+        region[mask] = np.clip(blended, 0, 255).astype(np.uint8)[mask]
+
+    def _draw_circle_additive(self, img: np.ndarray, x: float, y: float,
+                              r_px: float, color: np.ndarray):
+        """Draw an anti-aliased circle with additive blending (for glows)."""
+        ri = int(np.ceil(r_px)) + 1
+        x0, x1 = max(0, int(x) - ri), min(self.size, int(x) + ri + 1)
+        y0, y1 = max(0, int(y) - ri), min(self.size, int(y) + ri + 1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+        alpha = np.clip(r_px - dist + 0.5, 0.0, 1.0).astype(np.float32)
+        mask = alpha > 0
+        if not np.any(mask):
+            return
+        region = img[y0:y1, x0:x1]
+        add = color.astype(np.float32) * alpha[:, :, np.newaxis]
+        blended = np.clip(region.astype(np.float32) + add, 0, 255).astype(np.uint8)
+        region[mask] = blended[mask]
+
+    # ── Main render ─────────────────────────────────────────────────────
 
     def render(self, state: GameState) -> np.ndarray:
         """Render ego-centric view around the player's head."""
@@ -50,43 +111,42 @@ class NumpyRenderer:
             return img
 
         cx, cy = player.head_pos
+        vr = self._viewport_radius(player)
 
-        # Draw hexagonal grid background
-        self._draw_hex_grid(img, cx, cy)
+        # World-space pixel grids for this frame
+        px = self.px_norm * vr
+        py = self.py_norm * vr
 
-        # Draw arena boundary
-        self._draw_boundary(img, cx, cy)
+        self._draw_hex_grid(img, cx, cy, px, py)
+        self._draw_boundary(img, cx, cy, px, py)
+        self._draw_food(img, state, cx, cy, vr)
 
-        # Draw food (glowing pellets)
-        self._draw_food(img, state, cx, cy)
-
-        # Draw NPC snakes
         for i, snake in enumerate(state.snakes[1:]):
             if not snake.alive:
                 continue
             head_color, body_color = NPC_COLORS[i % len(NPC_COLORS)]
-            self._draw_snake(img, snake, cx, cy, body_color, head_color, snake.boosting)
+            self._draw_snake(img, snake, cx, cy, body_color, head_color,
+                             snake.boosting, vr)
 
-        # Draw player snake (on top)
-        self._draw_snake(img, player, cx, cy, PLAYER_BODY_COLOR, PLAYER_HEAD_COLOR, player.boosting)
+        self._draw_snake(img, player, cx, cy, PLAYER_BODY_COLOR,
+                         PLAYER_HEAD_COLOR, player.boosting, vr)
 
         return img
 
-    def _draw_hex_grid(self, img: np.ndarray, cx: float, cy: float):
+    # ── Background ──────────────────────────────────────────────────────
+
+    def _draw_hex_grid(self, img: np.ndarray, cx: float, cy: float,
+                       px: np.ndarray, py: np.ndarray):
         """Draw a hexagonal grid pattern like slither.io."""
-        hex_size = 30.0  # radius of each hexagon in world units
+        hex_size = 30.0
 
-        # World-space coordinates of each pixel
-        wx = self.px + cx
-        wy = self.py + cy
+        wx = px + cx
+        wy = py + cy
 
-        # Hex grid math: convert world coords to axial hex coordinates
-        # Using pointy-top hexagons
         sqrt3 = np.float32(1.7320508)
         q = (sqrt3 / 3.0 * wx - 1.0 / 3.0 * wy) / hex_size
         r = (2.0 / 3.0 * wy) / hex_size
 
-        # Round to nearest hex center (cube rounding)
         s = -q - r
         qi = np.round(q).astype(np.int32)
         ri = np.round(r).astype(np.int32)
@@ -96,56 +156,45 @@ class NumpyRenderer:
         r_diff = np.abs(ri.astype(np.float32) - r)
         s_diff = np.abs(si.astype(np.float32) - s)
 
-        # Fix rounding: the component with largest diff gets reset
         fix_q = (q_diff > r_diff) & (q_diff > s_diff)
         fix_r = (~fix_q) & (r_diff > s_diff)
-
         qi[fix_q] = (-ri - si)[fix_q]
         ri[fix_r] = (-qi - si)[fix_r]
 
-        # Convert hex center back to world coords
         hex_cx = hex_size * (sqrt3 * qi.astype(np.float32) + sqrt3 / 2.0 * ri.astype(np.float32))
         hex_cy = hex_size * (3.0 / 2.0 * ri.astype(np.float32))
 
-        # Distance from pixel to its hex center
         dx = wx - hex_cx
         dy = wy - hex_cy
-
-        # Distance to hex edge (approximate using max of 3 axes for pointy-top)
-        # For a pointy-top hex, the distance to edge can be approximated
         abs_dx = np.abs(dx)
         abs_dy = np.abs(dy)
-        # Hex edge distance using the hex norm
         dist_to_edge = np.maximum(
             abs_dy * (2.0 / 3.0),
-            abs_dy * (1.0 / 3.0) + abs_dx * (sqrt3 / 3.0)
+            abs_dy * (1.0 / 3.0) + abs_dx * (sqrt3 / 3.0),
         )
-
-        # Normalize by hex size
         edge_ratio = dist_to_edge / hex_size
+        edge_mask = edge_ratio > 0.85
 
-        # Pixels near the edge of their hex cell = grid lines
-        edge_width = 0.85  # threshold: closer to 1.0 = thinner lines
-        edge_mask = edge_ratio > edge_width
-
-        # Fill hexagons with slightly lighter color, edges with line color
         img[~edge_mask] = HEX_FILL_COLOR
         img[edge_mask] = HEX_LINE_COLOR
 
-    def _draw_boundary(self, img: np.ndarray, cx: float, cy: float):
-        """Draw arena boundary circle."""
-        wx = self.px + cx
-        wy = self.py + cy
+    def _draw_boundary(self, img: np.ndarray, cx: float, cy: float,
+                       px: np.ndarray, py: np.ndarray):
+        """Draw arena boundary circle (constant world-width line)."""
+        wx = px + cx
+        wy = py + cy
         dist = np.sqrt(wx * wx + wy * wy)
         r = self.config.arena_radius
-        boundary_mask = np.abs(dist - r) < 3.0
+        boundary_mask = np.abs(dist - r) < 5.0
         img[boundary_mask] = BOUNDARY_COLOR
-        # Shade outside arena
         outside_mask = dist > r
         img[outside_mask] = img[outside_mask] // 3
 
-    def _draw_food(self, img: np.ndarray, state: GameState, cx: float, cy: float):
-        """Draw glowing food pellets."""
+    # ── Food ────────────────────────────────────────────────────────────
+
+    def _draw_food(self, img: np.ndarray, state: GameState,
+                   cx: float, cy: float, vr: float):
+        """Draw glowing food pellets. All sizes in world units."""
         food = state.food
         active = food.active
         if not np.any(active):
@@ -154,12 +203,10 @@ class NumpyRenderer:
         positions = food.positions[active]
         colors = food.colors[active]
 
-        # Convert food positions to pixel space
         rel_x = positions[:, 0] - cx
         rel_y = positions[:, 1] - cy
 
-        # Cull food outside viewport (with margin)
-        margin = self.vr + self.config.food_radius
+        margin = vr + self.config.food_radius
         in_view = (np.abs(rel_x) < margin) & (np.abs(rel_y) < margin)
         if not np.any(in_view):
             return
@@ -168,39 +215,23 @@ class NumpyRenderer:
         rel_y = rel_y[in_view]
         colors = colors[in_view]
 
-        # Convert to pixel coordinates
-        half = self.size / 2
-        px = (rel_x / self.vr * half + half).astype(np.int32)
-        py = (rel_y / self.vr * half + half).astype(np.int32)
+        # Pixel positions (float for AA)
+        fpx = rel_x / vr * self.half + self.half
+        fpy = rel_y / vr * self.half + self.half
 
-        # Food radius in pixels (small glowing dots)
-        fr = max(1, int(self.config.food_radius / self.vr * half))
+        # World-space radii → pixel radii
+        fr = self._world_to_px_radius(self.config.food_radius, vr)
+        gr = self._world_to_px_radius(self.config.food_radius * 1.8, vr)
 
-        for k in range(len(px)):
-            x, y = px[k], py[k]
-            # Draw glow (larger, dimmer circle)
-            gr = fr + 1
-            x0, x1 = max(0, x - gr), min(self.size, x + gr + 1)
-            y0, y1 = max(0, y - gr), min(self.size, y + gr + 1)
-            if x0 >= x1 or y0 >= y1:
-                continue
-            yy, xx = np.ogrid[y0:y1, x0:x1]
-            glow_mask = (xx - x) ** 2 + (yy - y) ** 2 <= gr ** 2
+        for k in range(len(fpx)):
+            x, y = fpx[k], fpy[k]
+            # Glow
             glow_color = colors[k].astype(np.int16) // 3
-            region = img[y0:y1, x0:x1]
-            blended = np.clip(
-                region.astype(np.int16) + glow_color, 0, 255
-            ).astype(np.uint8)
-            region[glow_mask] = blended[glow_mask]
+            self._draw_circle_additive(img, x, y, gr, glow_color)
+            # Core
+            self._draw_circle(img, x, y, fr, colors[k])
 
-            # Draw core (bright center)
-            x0, x1 = max(0, x - fr), min(self.size, x + fr + 1)
-            y0, y1 = max(0, y - fr), min(self.size, y + fr + 1)
-            if x0 >= x1 or y0 >= y1:
-                continue
-            yy, xx = np.ogrid[y0:y1, x0:x1]
-            core_mask = (xx - x) ** 2 + (yy - y) ** 2 <= fr ** 2
-            img[y0:y1, x0:x1][core_mask] = colors[k]
+    # ── Snakes ──────────────────────────────────────────────────────────
 
     def _draw_snake(
         self,
@@ -210,82 +241,59 @@ class NumpyRenderer:
         cy: float,
         body_color: np.ndarray,
         head_color: np.ndarray,
-        boosting: bool = False,
+        boosting: bool,
+        vr: float,
     ):
-        """Draw a snake with slither.io-style segmented appearance."""
+        """Draw a snake. All sizes derived from the snake's world-space radius."""
         segments = snake.active_segments()
-        half = self.size / 2
 
-        # Convert to pixel space
         rel_x = segments[:, 0] - cx
         rel_y = segments[:, 1] - cy
 
-        # Cull segments outside viewport
-        margin = self.vr + self.config.body_radius * 2
+        # World-space radii (scale with this snake's own length)
+        world_br = snake.get_radius(self.config.body_radius, self.config.initial_length)
+        world_hr = snake.get_radius(self.config.head_radius, self.config.initial_length)
+
+        # Convert to float pixel radii
+        br = self._world_to_px_radius(world_br, vr)
+        hr = self._world_to_px_radius(world_hr, vr)
+
+        margin = vr + world_br * 2
         in_view = (np.abs(rel_x) < margin) & (np.abs(rel_y) < margin)
 
-        px_all = (rel_x / self.vr * half + half).astype(np.int32)
-        py_all = (rel_y / self.vr * half + half).astype(np.int32)
+        # Float pixel positions for AA
+        fpx = rel_x / vr * self.half + self.half
+        fpy = rel_y / vr * self.half + self.half
 
-        # Body radius in pixels
-        br = max(1, int(self.config.body_radius / self.vr * half))
-        hr = max(2, int(self.config.head_radius / self.vr * half))
-
-        # When boosting, brighten colors for glow effect
+        # Boost glow: brighten colours
         if boosting:
             body_color = np.clip(body_color.astype(np.int16) + 50, 0, 255).astype(np.uint8)
             head_color = np.clip(head_color.astype(np.int16) + 50, 0, 255).astype(np.uint8)
 
-        # Compute a darker shade for segment ridges
         dark_body = np.clip(body_color.astype(np.int16) * 2 // 3, 0, 255).astype(np.uint8)
 
-        # Draw glow aura when boosting (larger, dimmer circles behind each segment)
+        # Boost aura
         if boosting:
+            glow_r = self._world_to_px_radius(world_br * 1.6, vr)
             glow_color = body_color.astype(np.int16) // 4
-            gr = br + 2
             for k in range(len(segments) - 1, -1, -1):
                 if not in_view[k]:
                     continue
-                x, y = px_all[k], py_all[k]
-                x0, x1 = max(0, x - gr), min(self.size, x + gr + 1)
-                y0, y1 = max(0, y - gr), min(self.size, y + gr + 1)
-                if x0 >= x1 or y0 >= y1:
-                    continue
-                yy, xx = np.ogrid[y0:y1, x0:x1]
-                glow_mask = (xx - x) ** 2 + (yy - y) ** 2 <= gr ** 2
-                region = img[y0:y1, x0:x1]
-                blended = np.clip(region.astype(np.int16) + glow_color, 0, 255).astype(np.uint8)
-                region[glow_mask] = blended[glow_mask]
+                self._draw_circle_additive(img, fpx[k], fpy[k], glow_r, glow_color)
 
-        # Draw body segments (tail-first so head draws on top)
+        # Body & head (tail-first so head draws on top)
         for k in range(len(segments) - 1, -1, -1):
             if not in_view[k]:
                 continue
-            x, y = px_all[k], py_all[k]
-            r = hr if k == 0 else br
             is_head = k == 0
-
-            x0, x1 = max(0, x - r - 1), min(self.size, x + r + 2)
-            y0, y1 = max(0, y - r - 1), min(self.size, y + r + 2)
-            if x0 >= x1 or y0 >= y1:
-                continue
-
-            yy, xx = np.ogrid[y0:y1, x0:x1]
-            dist_sq = (xx - x) ** 2 + (yy - y) ** 2
+            r = hr if is_head else br
 
             if is_head:
-                # Head: bright with highlight
-                circle = dist_sq <= r ** 2
-                img[y0:y1, x0:x1][circle] = head_color
-                # Add a small highlight dot for "eye" effect
-                highlight_r = max(1, r // 3)
-                highlight = dist_sq <= highlight_r ** 2
+                self._draw_circle(img, fpx[k], fpy[k], r, head_color)
+                # Highlight
+                highlight_r = max(0.5, r / 3.0)
                 bright = np.clip(head_color.astype(np.int16) + 60, 0, 255).astype(np.uint8)
-                img[y0:y1, x0:x1][highlight] = bright
+                self._draw_circle(img, fpx[k], fpy[k], highlight_r, bright)
             else:
-                # Body: alternating shade for segment ridges
-                circle = dist_sq <= r ** 2
-                if k % 2 == 0:
-                    img[y0:y1, x0:x1][circle] = body_color
-                else:
-                    img[y0:y1, x0:x1][circle] = dark_body
+                color = body_color if k % 2 == 0 else dark_body
+                self._draw_circle(img, fpx[k], fpy[k], r, color)

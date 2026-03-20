@@ -91,5 +91,15 @@ class Snake:
         self.length = max(self.length - lose, 3)  # minimum viable snake
         self.tail_idx = (self.head_idx - self.length + 1) % self.max_length
 
+    def get_radius(self, base_radius: float, initial_length: int) -> float:
+        """Return scaled radius based on current length.
+
+        Uses the same 0.4*log coefficient as the viewport zoom so the
+        player's own snake keeps a constant apparent thickness on screen.
+        """
+        ratio = self.length / initial_length
+        scale = 1.0 + 0.4 * np.log(max(1.0, ratio))
+        return base_radius * scale
+
     def kill(self):
         self.alive = False

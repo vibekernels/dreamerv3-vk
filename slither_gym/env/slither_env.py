@@ -26,7 +26,7 @@ class SlitherEnv(gym.Env):
         self,
         render_mode: str | None = None,
         num_npcs: int = 4,
-        arena_radius: float = 500.0,
+        arena_radius: float = 1000.0,
         max_steps: int = 4000,
         obs_size: int = 64,
         viewport_radius: float = 120.0,

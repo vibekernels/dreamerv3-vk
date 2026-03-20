@@ -91,7 +91,8 @@ class GameState:
         for snake in self.snakes:
             if not snake.alive:
                 continue
-            eaten = self.food.check_eat(snake.head_pos, self.config.head_radius)
+            hr = snake.get_radius(self.config.head_radius, self.config.initial_length)
+            eaten = self.food.check_eat(snake.head_pos, hr)
             if eaten > 0:
                 snake.grow(eaten)
                 snake.score += eaten
@@ -202,7 +203,9 @@ class GameState:
 
         diffs = body - head
         dists_sq = np.sum(diffs * diffs, axis=1)
-        collision_dist = self.config.head_radius + self.config.body_radius
+        hr = snake.get_radius(self.config.head_radius, self.config.initial_length)
+        br = other.get_radius(self.config.body_radius, self.config.initial_length)
+        collision_dist = hr + br
         return bool(np.any(dists_sq < collision_dist ** 2))
 
     def _kill_snake(self, idx: int, killer_id: int):

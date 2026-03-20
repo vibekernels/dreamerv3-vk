@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class GameConfig:
     # Arena
-    arena_radius: float = 500.0
+    arena_radius: float = 1000.0
 
     # Snake physics
     base_speed: float = 3.0
@@ -13,15 +13,15 @@ class GameConfig:
     initial_length: int = 10
     max_length: int = 500
     segment_spacing: float = 4.0     # distance between segments
-    head_radius: float = 6.0
-    body_radius: float = 5.0
+    head_radius: float = 8.0
+    body_radius: float = 6.5
     boost_mass_cost: float = 0.2     # length lost per step while boosting
 
     # Food
-    max_food: int = 600
-    food_radius: float = 4.0
+    max_food: int = 2000
+    food_radius: float = 8.0
     food_value: float = 1.0          # length gained per food
-    initial_food: int = 200
+    initial_food: int = 800
     food_respawn_rate: int = 3       # new food per step (up to max)
     death_food_fraction: float = 0.8 # fraction of length dropped as food on death
 
