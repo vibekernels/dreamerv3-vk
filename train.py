@@ -24,6 +24,7 @@ import gymnasium as gym
 
 from slither_gym.dreamer.agent import DreamerV3Agent
 from slither_gym.dreamer.replay_buffer import ReplayBuffer
+from slither_gym.env.rewards import RewardConfig
 
 
 def collect_episode(env: gym.Env, agent: DreamerV3Agent, action_dim: int) -> dict:
@@ -72,6 +73,10 @@ def main():
     parser.add_argument("--prefill", type=int, default=5000, help="Random steps before training starts")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--food_reward", type=float, default=1.0, help="Reward per food eaten")
+    parser.add_argument("--kill_reward", type=float, default=5.0, help="Reward per kill")
+    parser.add_argument("--death_scale", type=float, default=0.1, help="Death penalty = -death_scale * length")
+    parser.add_argument("--survival_bonus", type=float, default=0.0, help="Per-step survival reward")
     args = parser.parse_args()
 
     # Setup
@@ -84,7 +89,13 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    env = gym.make("Slither-v0")
+    reward_config = RewardConfig(
+        food_eaten=args.food_reward,
+        kill_opponent=args.kill_reward,
+        death_scale=args.death_scale,
+        survival_per_step=args.survival_bonus,
+    )
+    env = gym.make("Slither-v0", reward_config=reward_config)
     action_dim = env.action_space.n
 
     agent = DreamerV3Agent(
