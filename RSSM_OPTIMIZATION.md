@@ -71,9 +71,21 @@ Profiling showed `Memcpy HtoD (Pageable → Device)` was 50% of CUDA time. Sendi
 
 Enabled `torch.set_float32_matmul_precision("high")` for TF32 tensor core usage on Ampere+ GPUs. Negligible precision impact for RL workloads.
 
+### 6. State caching between training phases ✅
+
+`_train_world_model` now caches the final posterior `RSSMState` (detached). `_train_actor_critic` uses this directly as the imagination starting state, eliminating a redundant 50-step RSSM observe loop (~275 ms saved). The state was computed with pre-update weights (before optimizer step); the difference from re-running with post-update weights is negligible for a single Adam step.
+
+### 7. Vectorized KL loss ✅
+
+Replaced the Python loop over T timesteps in `_kl_loss` with batched tensor operations. Stacks all posterior stochs and prior logits into `(T, B, S, C)` tensors and computes KL in one vectorized pass.
+
+### 8. Compiled decoder ✅
+
+`torch.compile(decoder, mode="default")` for training. Fuses the transposed convolution forward + backward kernels. Stored separately as `self._compiled_decoder` so inference paths use the uncompiled module.
+
 ### Combined result
 
-**Full `train_step`: 2700 ms → 1412 ms (1.91× speedup)** on RTX 4090.
+**Full `train_step`: 2700 ms → 1064 ms (2.54× speedup)** on RTX 4090.
 
 ## Remaining approaches
 

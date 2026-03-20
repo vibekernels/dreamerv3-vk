@@ -104,8 +104,19 @@ class DreamerV3Agent:
             self._compiled_observe = rssm.observe_step
             self._compiled_imagine = rssm.imagine_step
 
-        # Cache for sharing embeddings between world-model and actor-critic training
+        # Compile decoder for training (fuses forward + backward convolution kernels).
+        # Stored separately so inference paths use the uncompiled module.
+        if self.device.type == "cuda":
+            try:
+                self._compiled_decoder = torch.compile(self.world_model.decoder, mode="default")
+            except Exception:
+                self._compiled_decoder = self.world_model.decoder
+        else:
+            self._compiled_decoder = self.world_model.decoder
+
+        # Caches shared between world-model and actor-critic training phases
         self._train_embed_cache: torch.Tensor | None = None
+        self._train_state_cache: RSSMState | None = None
 
         # Optimizers
         self.model_opt = torch.optim.Adam(self.world_model.parameters(), lr=lr_model, eps=1e-8)
@@ -243,12 +254,17 @@ class DreamerV3Agent:
             features_list.append(features)
             prev_state = post_state
 
+        # Cache final posterior state (detached) for actor-critic imagination starting state.
+        # Avoids re-running the entire 50-step RSSM loop in _train_actor_critic.
+        self._train_state_cache = RSSMState(
+            deter=post_state.deter.detach(), stoch=post_state.stoch.detach()
+        )
         features = torch.stack(features_list, dim=1)  # (B, T, D)
 
         with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             # Decode
             feat_flat = features.reshape(B * T, -1)
-            recon = self.world_model.decoder(feat_flat)
+            recon = self._compiled_decoder(feat_flat)
             obs_target = obs.reshape(B * T, *obs.shape[2:])
 
             # Image reconstruction loss (MSE on symlog-scaled pixels)
@@ -285,56 +301,46 @@ class DreamerV3Agent:
         }
 
     def _kl_loss(self, posts, priors_logits):
-        """Compute KL divergence with free nats."""
-        total_kl = 0.0
-        for post_state, prior_logits in zip(posts, priors_logits):
-            post_logits = self.world_model.rssm.post_net(
-                torch.cat([
-                    post_state["deter"],
-                    self.world_model.encoder(torch.zeros(1, device=self.device).expand(post_state["deter"].shape[0], -1)) if False else
-                    torch.zeros(1)  # placeholder
-                ], dim=-1)
-            ) if False else None
+        """Compute KL divergence with free nats (vectorized over T)."""
+        # Stack all timesteps: (T, B, stoch_dim, class_size) → (T*B, stoch_dim, class_size)
+        post_stochs = torch.stack([p.stoch for p in posts])      # (T, B, S, C)
+        prior_logits = torch.stack(priors_logits)                 # (T, B, S, C)
 
-            # Use stored stochastic samples to compute KL
-            post_stoch = post_state.stoch  # (B, stoch_dim, class_size)
-            post_probs = post_stoch  # already one-hot-ish from straight-through
-            prior_probs = F.softmax(prior_logits, dim=-1)
+        post_probs = post_stochs.clamp(1e-8, 1.0)
+        prior_probs = F.softmax(prior_logits, dim=-1).clamp(1e-8, 1.0)
 
-            # KL(post || prior) ≈ sum post * (log post - log prior)
-            post_probs_safe = post_probs.clamp(1e-8, 1.0)
-            prior_probs_safe = prior_probs.clamp(1e-8, 1.0)
-
-            kl = (post_probs_safe * (post_probs_safe.log() - prior_probs_safe.log())).sum(dim=-1).mean()
-            kl = torch.clamp(kl, min=self.free_nats)
-            total_kl = total_kl + kl
-
-        return total_kl / len(posts)
+        # KL(post || prior) per (T, B, stoch_dim) → mean over B and stoch_dim
+        kl_per_step = (post_probs * (post_probs.log() - prior_probs.log())).sum(dim=-1).mean(dim=(1, 2))  # (T,)
+        kl_per_step = torch.clamp(kl_per_step, min=self.free_nats)
+        return kl_per_step.mean()
 
     def _train_actor_critic(self, obs, actions, B, T):
         """Train actor and critic through imagination in the world model."""
-        # Get a starting state from the world model (detach from model graph).
-        # Reuse embeddings computed during world-model training to avoid a second encoder pass.
-        with torch.no_grad():
-            if self._train_embed_cache is not None:
-                embed = self._train_embed_cache
-            else:
-                with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                    obs_flat = obs.reshape(B * T, *obs.shape[2:])
-                    embed_flat = self.world_model.encoder(obs_flat)
-                embed = embed_flat.float().reshape(B, T, -1)
+        # Reuse the final posterior state from world-model training instead of
+        # re-running the entire 50-step RSSM loop.  Falls back to full recomputation
+        # if the cache is unavailable.
+        if self._train_state_cache is not None:
+            state = self._train_state_cache
+        else:
+            with torch.no_grad():
+                if self._train_embed_cache is not None:
+                    embed = self._train_embed_cache
+                else:
+                    with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                        obs_flat = obs.reshape(B * T, *obs.shape[2:])
+                        embed_flat = self.world_model.encoder(obs_flat)
+                    embed = embed_flat.float().reshape(B, T, -1)
 
-            state = self.world_model.rssm.initial_state(B, self.device)
-            for t in range(T):
-                state, _, _ = self._compiled_observe(state, actions[:, t], embed[:, t])
-
-        # Flatten batch for imagination start states
-        start_features = self.world_model.rssm.get_features(state).detach()
+                state = self.world_model.rssm.initial_state(B, self.device)
+                for t in range(T):
+                    state, _, _ = self._compiled_observe(state, actions[:, t], embed[:, t])
+                state = RSSMState(deter=state.deter.detach(), stoch=state.stoch.detach())
 
         # Imagine forward — actor learns through differentiable world model dynamics
+        start_features = self.world_model.rssm.get_features(state)
         imagined_features = [start_features]
         imagined_actions = []
-        curr_state = RSSMState(deter=state.deter.detach(), stoch=state.stoch.detach())
+        curr_state = state
 
         for _ in range(self.imagine_horizon):
             features = self.world_model.rssm.get_features(curr_state)
