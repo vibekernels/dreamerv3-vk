@@ -14,6 +14,7 @@ class ReplayBuffer:
 
         self._episodes: list[dict[str, np.ndarray]] = []
         self._total_steps = 0
+        self._ep_lengths: list[int] = []  # cached for fast sampling
 
     def add_episode(self, episode: dict[str, np.ndarray]):
         """Add a completed episode. Keys: obs, action, reward, cont (continue flag)."""
@@ -22,11 +23,13 @@ class ReplayBuffer:
             return  # too short
 
         self._episodes.append(episode)
+        self._ep_lengths.append(ep_len)
         self._total_steps += ep_len
 
         # Evict old episodes if over capacity
         while self._total_steps > self.capacity and len(self._episodes) > 1:
             removed = self._episodes.pop(0)
+            self._ep_lengths.pop(0)
             self._total_steps -= len(removed["reward"])
 
     @property
@@ -34,27 +37,37 @@ class ReplayBuffer:
         return self._total_steps
 
     def sample(self, batch_size: int) -> dict[str, np.ndarray]:
-        """Sample a batch of sequences of length seq_len."""
-        obs_list, act_list, rew_list, cont_list = [], [], [], []
+        """Sample a batch of sequences of length seq_len (vectorized)."""
+        n_eps = len(self._episodes)
 
-        for _ in range(batch_size):
-            # Pick a random episode weighted by length
-            ep_idx = np.random.randint(len(self._episodes))
-            ep = self._episodes[ep_idx]
-            ep_len = len(ep["reward"])
+        # Pick random episodes and start indices in bulk
+        ep_indices = np.random.randint(0, n_eps, size=batch_size)
+        # Compute max_start per selected episode, then sample starts
+        max_starts = np.array([self._ep_lengths[i] - self.seq_len for i in ep_indices])
+        starts = (np.random.random(batch_size) * (max_starts + 1)).astype(np.intp)
 
-            # Pick a random start index
-            max_start = ep_len - self.seq_len
-            start = np.random.randint(0, max_start + 1)
+        # Pre-allocate output arrays
+        sample_ep = self._episodes[ep_indices[0]]
+        obs_shape = sample_ep["obs"].shape[1:]   # (3, 64, 64)
+        act_dim = sample_ep["action"].shape[1]   # action_dim
 
-            obs_list.append(ep["obs"][start:start + self.seq_len])
-            act_list.append(ep["action"][start:start + self.seq_len])
-            rew_list.append(ep["reward"][start:start + self.seq_len])
-            cont_list.append(ep["cont"][start:start + self.seq_len])
+        obs = np.empty((batch_size, self.seq_len, *obs_shape), dtype=np.float32)
+        actions = np.empty((batch_size, self.seq_len, act_dim), dtype=np.float32)
+        rewards = np.empty((batch_size, self.seq_len), dtype=np.float32)
+        conts = np.empty((batch_size, self.seq_len), dtype=np.float32)
+
+        for i in range(batch_size):
+            ep = self._episodes[ep_indices[i]]
+            s = starts[i]
+            e = s + self.seq_len
+            obs[i] = ep["obs"][s:e]
+            actions[i] = ep["action"][s:e]
+            rewards[i] = ep["reward"][s:e]
+            conts[i] = ep["cont"][s:e]
 
         return {
-            "obs": np.stack(obs_list),        # (B, T, 3, 64, 64)
-            "action": np.stack(act_list),      # (B, T, action_dim)
-            "reward": np.stack(rew_list),      # (B, T)
-            "cont": np.stack(cont_list),       # (B, T)
+            "obs": obs,           # (B, T, 3, 64, 64)
+            "action": actions,    # (B, T, action_dim)
+            "reward": rewards,    # (B, T)
+            "cont": conts,        # (B, T)
         }

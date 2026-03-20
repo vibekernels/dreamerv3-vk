@@ -38,6 +38,8 @@ class DreamerV3Agent:
         reward_bins: int = 255,
         free_nats: float = 1.0,
         kl_scale: float = 0.5,
+        use_amp: bool = True,
+        compile_models: bool = True,
     ):
         self.device = torch.device(device)
         self.action_dim = action_dim
@@ -48,6 +50,10 @@ class DreamerV3Agent:
         self.reward_bins = reward_bins
         self.free_nats = free_nats
         self.kl_scale = kl_scale
+
+        # Mixed precision
+        self.use_amp = use_amp and self.device.type == "cuda"
+        self.amp_dtype = torch.bfloat16
 
         # Networks
         self.world_model = WorldModel(
@@ -66,6 +72,14 @@ class DreamerV3Agent:
         self.critic = Critic(state_dim, hidden_dim, num_bins=reward_bins).to(self.device)
         self.slow_critic = Critic(state_dim, hidden_dim, num_bins=reward_bins).to(self.device)
         self.slow_critic.load_state_dict(self.critic.state_dict())
+
+        # torch.compile for key modules
+        if compile_models and self.device.type == "cuda":
+            try:
+                self.world_model.encoder = torch.compile(self.world_model.encoder)
+                self.world_model.decoder = torch.compile(self.world_model.decoder)
+            except Exception:
+                pass  # fallback gracefully if compile fails
 
         # Optimizers
         self.model_opt = torch.optim.Adam(self.world_model.parameters(), lr=lr_model, eps=1e-8)
@@ -91,11 +105,12 @@ class DreamerV3Agent:
         obs_t = torch.from_numpy(obs).float().permute(2, 0, 1).unsqueeze(0).to(self.device) / 255.0
 
         # Encode
-        embed = self.world_model.encoder(obs_t)
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            embed = self.world_model.encoder(obs_t)
 
-        # RSSM step
+        # RSSM step (keep in fp32 for recurrent stability)
         post_state, _, _ = self.world_model.rssm.observe_step(
-            self._prev_state, self._prev_action, embed
+            self._prev_state, self._prev_action, embed.float()
         )
 
         # Get features and sample action
@@ -137,19 +152,21 @@ class DreamerV3Agent:
         return {**model_metrics, **ac_metrics}
 
     def _train_world_model(self, obs, actions, rewards, conts, B, T):
-        # Encode all observations
-        obs_flat = obs.reshape(B * T, *obs.shape[2:])
-        embed_flat = self.world_model.encoder(obs_flat)
-        embed = embed_flat.reshape(B, T, -1)
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            # Encode all observations
+            obs_flat = obs.reshape(B * T, *obs.shape[2:])
+            embed_flat = self.world_model.encoder(obs_flat)
+            embed = embed_flat.reshape(B, T, -1)
 
-        # Run RSSM forward
+        # Run RSSM forward (fp32 for recurrent stability)
+        embed_f32 = embed.float()
         prev_state = self.world_model.rssm.initial_state(B, self.device)
         posts, priors_logits = [], []
         features_list = []
 
         for t in range(T):
             post_state, prior_state, prior_logits = self.world_model.rssm.observe_step(
-                prev_state, actions[:, t], embed[:, t]
+                prev_state, actions[:, t], embed_f32[:, t]
             )
             features = self.world_model.rssm.get_features(post_state)
             posts.append(post_state)
@@ -159,26 +176,27 @@ class DreamerV3Agent:
 
         features = torch.stack(features_list, dim=1)  # (B, T, D)
 
-        # Decode
-        feat_flat = features.reshape(B * T, -1)
-        recon = self.world_model.decoder(feat_flat)
-        obs_target = obs.reshape(B * T, *obs.shape[2:])
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            # Decode
+            feat_flat = features.reshape(B * T, -1)
+            recon = self.world_model.decoder(feat_flat)
+            obs_target = obs.reshape(B * T, *obs.shape[2:])
 
-        # Image reconstruction loss (MSE on symlog-scaled pixels)
-        recon_loss = F.mse_loss(recon, obs_target)
+            # Image reconstruction loss (MSE on symlog-scaled pixels)
+            recon_loss = F.mse_loss(recon, obs_target)
 
-        # Reward prediction loss (twohot cross-entropy)
-        reward_logits = self.world_model.reward_head(feat_flat).reshape(B, T, -1)
-        reward_target = twohot_encode(
-            symlog(rewards), self.reward_bins
-        )
-        reward_loss = -torch.sum(reward_target * F.log_softmax(reward_logits, dim=-1), dim=-1).mean()
+            # Reward prediction loss (twohot cross-entropy)
+            reward_logits = self.world_model.reward_head(feat_flat).reshape(B, T, -1)
+            reward_target = twohot_encode(
+                symlog(rewards), self.reward_bins
+            )
+            reward_loss = -torch.sum(reward_target * F.log_softmax(reward_logits, dim=-1), dim=-1).mean()
 
-        # Continue prediction loss (binary cross-entropy)
-        cont_logits = self.world_model.continue_head(feat_flat).reshape(B, T)
-        cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
+            # Continue prediction loss (binary cross-entropy)
+            cont_logits = self.world_model.continue_head(feat_flat).reshape(B, T)
+            cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
 
-        # KL loss (free nats, balanced)
+        # KL loss (fp32)
         kl_loss = self._kl_loss(posts, priors_logits)
 
         # Total
@@ -228,9 +246,10 @@ class DreamerV3Agent:
         """Train actor and critic through imagination in the world model."""
         # Get a starting state from the world model (detach from model graph)
         with torch.no_grad():
-            obs_flat = obs.reshape(B * T, *obs.shape[2:])
-            embed_flat = self.world_model.encoder(obs_flat)
-            embed = embed_flat.reshape(B, T, -1)
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                obs_flat = obs.reshape(B * T, *obs.shape[2:])
+                embed_flat = self.world_model.encoder(obs_flat)
+            embed = embed_flat.float().reshape(B, T, -1)
 
             state = self.world_model.rssm.initial_state(B, self.device)
             for t in range(T):

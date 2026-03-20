@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--steps", type=int, default=500_000, help="Total env steps")
     parser.add_argument("--logdir", type=str, default="runs/slither", help="TensorBoard log dir")
     parser.add_argument("--save_every", type=int, default=50_000, help="Save checkpoint every N steps")
-    parser.add_argument("--batch_size", type=int, default=16, help="Training batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
     parser.add_argument("--seq_len", type=int, default=50, help="Sequence length for training")
     parser.add_argument("--train_ratio", type=int, default=512, help="Train steps per env step ratio (as in DreamerV3)")
     parser.add_argument("--prefill", type=int, default=5000, help="Random steps before training starts")
@@ -77,6 +77,8 @@ def main():
     parser.add_argument("--kill_reward", type=float, default=5.0, help="Reward per kill")
     parser.add_argument("--death_scale", type=float, default=0.1, help="Death penalty = -death_scale * length")
     parser.add_argument("--survival_bonus", type=float, default=0.0, help="Per-step survival reward")
+    parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile")
     args = parser.parse_args()
 
     # Setup
@@ -101,6 +103,8 @@ def main():
     agent = DreamerV3Agent(
         action_dim=action_dim,
         device=args.device,
+        use_amp=not args.no_amp,
+        compile_models=not args.no_compile,
     )
 
     if args.resume:
@@ -144,9 +148,11 @@ def main():
     last_save = 0
     start_time = time.time()
 
+    amp_status = "ON (bf16)" if agent.use_amp else "OFF"
     print(f"\nStarting training on {args.device} for {args.steps} env steps...")
     print(f"Train ratio: {args.train_ratio} (train {args.train_ratio} steps per episode)")
     print(f"Batch size: {args.batch_size}, Sequence length: {args.seq_len}")
+    print(f"Mixed precision: {amp_status}")
     print(f"Logging to: {logdir}\n")
 
     while total_env_steps < args.steps:
