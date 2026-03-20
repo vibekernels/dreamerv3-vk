@@ -114,8 +114,7 @@ class DreamerV3Agent:
         else:
             self._compiled_decoder = self.world_model.decoder
 
-        # Caches shared between world-model and actor-critic training phases
-        self._train_embed_cache: torch.Tensor | None = None
+        # Final RSSM state from world-model training, reused as actor-critic starting state
         self._train_state_cache: RSSMState | None = None
 
         # Optimizers
@@ -236,10 +235,9 @@ class DreamerV3Agent:
             embed_flat = self.world_model.encoder(obs_flat)
             embed = embed_flat.reshape(B, T, -1)
 
-        # Run RSSM forward (fp32 for recurrent stability)
+        # Run RSSM forward (fp32 — at B=32, dim=512 ops are memory-bandwidth bound,
+        # so bfloat16 tensor cores don't help and the manual GRU adds kernel overhead).
         embed_f32 = embed.float()
-        # Cache detached embeddings for actor-critic (avoids a second encoder forward pass)
-        self._train_embed_cache = embed_f32.detach()
         prev_state = self.world_model.rssm.initial_state(B, self.device)
         posts, priors_logits = [], []
         features_list = []
@@ -255,7 +253,6 @@ class DreamerV3Agent:
             prev_state = post_state
 
         # Cache final posterior state (detached) for actor-critic imagination starting state.
-        # Avoids re-running the entire 50-step RSSM loop in _train_actor_critic.
         self._train_state_cache = RSSMState(
             deter=post_state.deter.detach(), stoch=post_state.stoch.detach()
         )
@@ -281,7 +278,7 @@ class DreamerV3Agent:
             cont_logits = self.world_model.continue_head(feat_flat).reshape(B, T)
             cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
 
-        # KL loss (fp32)
+        # KL loss
         kl_loss = self._kl_loss(posts, priors_logits)
 
         # Total
@@ -323,13 +320,10 @@ class DreamerV3Agent:
             state = self._train_state_cache
         else:
             with torch.no_grad():
-                if self._train_embed_cache is not None:
-                    embed = self._train_embed_cache
-                else:
-                    with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                        obs_flat = obs.reshape(B * T, *obs.shape[2:])
-                        embed_flat = self.world_model.encoder(obs_flat)
-                    embed = embed_flat.float().reshape(B, T, -1)
+                with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                    obs_flat = obs.reshape(B * T, *obs.shape[2:])
+                    embed_flat = self.world_model.encoder(obs_flat)
+                embed = embed_flat.float().reshape(B, T, -1)
 
                 state = self.world_model.rssm.initial_state(B, self.device)
                 for t in range(T):

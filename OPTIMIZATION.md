@@ -87,6 +87,35 @@ Replaced the Python loop over T timesteps in `_kl_loss` with batched tensor oper
 
 **Full `train_step`: 2700 ms → 1064 ms (2.54× speedup)** on RTX 4090.
 
+## Approaches tested but not adopted
+
+### bfloat16 RSSM
+
+Tested running the RSSM loop under `torch.amp.autocast(dtype=bfloat16)`. bfloat16 has the same exponent range as fp32 (8-bit), so GRU dynamics are stable. However:
+
+- `nn.GRUCell` doesn't participate in autocast (`_VF.gru_cell` requires matching dtypes). Required replacing with a manual GRU implementation using `F.linear`.
+- The manual GRU launches more kernels than the fused C++ `nn.GRUCell`, adding overhead.
+- At B=32, dim=512, the matmuls are **memory-bandwidth bound**, not compute-bound. bfloat16 tensor cores accelerate compute-bound operations but don't help here.
+- **Result**: 1180 ms (slower than fp32's 1064 ms). Would only help at much larger batch sizes (B≥256+).
+
+### Manual GRU cell (fp32)
+
+Tested replacing `nn.GRUCell` with `F.linear`-based implementation for better torch.compile visibility. Result: 1117 ms vs 1064 ms — the fused C++ GRU kernel is still faster.
+
+## Remaining time budget breakdown (RTX 4090, B=32, T=50)
+
+| Phase | Time | Notes |
+|---|---|---|
+| Encoder forward | 6 ms | Already fast, not worth optimizing |
+| RSSM forward (50 steps) | 276 ms | 5.5 ms/step, memory-bandwidth bound |
+| Decoder + heads forward | 16 ms | |
+| KL loss | 4 ms | Vectorized |
+| **Backward (BPTT + decoder)** | **443 ms** | **Dominant bottleneck** |
+| Optimizer step | 7 ms | |
+| Actor-critic (imagination) | 321 ms | 15 imagine steps + critic/actor loss+backward |
+
+The backward pass through 50 RSSM steps (BPTT) at 443 ms is the main remaining target. It's fundamentally limited by the sequential reverse traversal of the computation graph.
+
 ## Remaining approaches
 
 ### Approach 1: Fused CUDA kernel
