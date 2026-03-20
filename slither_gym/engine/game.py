@@ -59,6 +59,7 @@ class GameState:
             "killed_opponent": 0,
             "died": False,
             "boosting": False,
+            "length": self.player.length,
         }
 
         # Apply player action
