@@ -217,7 +217,6 @@ No measurable speedup on its own at B=128, but reduces kernel launch overhead at
 
 **Full `train_step` (Mamba, B=128): 57.7 ms** on RTX 5090 (theoretical SPS=217).
 **Full `train_step` (Mamba, B=384): 158.6 ms** on RTX 5090 (theoretical SPS=236).
-**End-to-end SPS: ~270 (B=128, 4 envs), ~320 (B=384, 8 envs)** on RTX 5090.
 
 Recommended 5090 flags: `--rssm_type mamba --batch_size 384 --num_envs 8 --device cuda`
 Alternative (lower VRAM): `--rssm_type mamba --batch_size 128 --device cuda`
@@ -359,7 +358,7 @@ All measurements on RTX 5090 (32 GB GDDR7), Mamba RSSM, T=50, train_ratio=512.
 | 512 | 228.5 | 219 | 30.8 GB | Requires --grad_checkpoint |
 | 640 | 283.7 | 220 | 32.0 GB | Requires --grad_checkpoint |
 
-End-to-end SPS with 8 async envs: ~320-350 SPS at B=384.
+Sustained training throughput: **242 SPS** at B=384 (the training bottleneck).
 
 ## Remaining approaches
 
