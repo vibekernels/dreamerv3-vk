@@ -268,12 +268,16 @@ def main():
 
     buffer = ReplayBuffer(capacity=1_000_000, seq_len=args.seq_len)
 
-    # --- Prefill with random actions ---
+    # --- Prefill buffer ---
     print(f"Prefilling buffer with {args.prefill} steps of random actions...")
     prefill_eps, prefill_steps = collect_random_episodes(reward_config, action_dim, args.prefill)
     for ep in prefill_eps:
         buffer.add_episode(ep)
     print(f"Prefilled {buffer.total_steps} steps across {len(buffer._episodes)} episodes")
+
+    # When resuming, we need to fill the buffer with on-policy data before
+    # training to avoid catastrophic forgetting from the high train ratio
+    min_buffer_for_training = 50_000 if args.resume else 0
 
     # --- Main training loop ---
     total_env_steps = resumed_env_steps + buffer.total_steps
@@ -281,6 +285,8 @@ def main():
     episode_count = 0
     last_save = 0
     pending_env_steps = 0  # steps collected but not yet trained on
+    steps_at_start = total_env_steps  # for accurate SPS calculation
+    warmup_logged = False
     start_time = time.time()
 
     use_async = not args.no_async and args.device != "cpu"
@@ -320,7 +326,7 @@ def main():
                 buffer.add_episode(ep)
 
                 elapsed = time.time() - start_time
-                sps = total_env_steps / elapsed if elapsed > 0 else 0
+                sps = (total_env_steps - steps_at_start) / elapsed if elapsed > 0 else 0
                 print(f"Episode {episode_count:>5d} | "
                       f"Steps: {total_env_steps:>8d}/{args.steps} | "
                       f"Return: {ep_return:>7.2f} | "
@@ -332,7 +338,15 @@ def main():
                 writer.add_scalar("performance/sps", sps, total_env_steps)
 
             # Train: proportional to accumulated env steps
-            if pending_env_steps > 0:
+            # Skip training until buffer has enough on-policy data (prevents
+            # catastrophic forgetting when resuming with empty buffer)
+            if pending_env_steps > 0 and buffer.total_steps >= min_buffer_for_training:
+                if min_buffer_for_training > 0 and not warmup_logged:
+                    print(f"  Buffer warmed up ({buffer.total_steps} steps), starting training...")
+                    warmup_logged = True
+                    # Don't train on all the accumulated pending steps at once
+                    pending_env_steps = min(pending_env_steps, args.batch_size * args.seq_len)
+
                 n_train = max(1, pending_env_steps * args.train_ratio // (args.batch_size * args.seq_len))
                 # Cap per iteration to keep collection responsive
                 n_train = min(n_train, 64)
@@ -350,6 +364,10 @@ def main():
                 for k, v in metrics.items():
                     writer.add_scalar(f"train/{k}", v, total_env_steps)
                 writer.add_scalar("train/train_steps", train_steps, total_env_steps)
+            elif buffer.total_steps < min_buffer_for_training:
+                # Still warming up - discard pending steps so we don't do a
+                # massive burst of training once the threshold is reached
+                pending_env_steps = 0
 
             # Save checkpoint
             if total_env_steps - last_save >= args.save_every:
@@ -373,7 +391,7 @@ def main():
             buffer.add_episode(episode)
 
             elapsed = time.time() - start_time
-            sps = total_env_steps / elapsed if elapsed > 0 else 0
+            sps = (total_env_steps - steps_at_start) / elapsed if elapsed > 0 else 0
             print(f"Episode {episode_count:>5d} | "
                   f"Steps: {total_env_steps:>8d}/{args.steps} | "
                   f"Return: {ep_return:>7.2f} | "
