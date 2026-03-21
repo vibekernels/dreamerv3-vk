@@ -220,6 +220,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=50, help="Sequence length for training")
     parser.add_argument("--train_ratio", type=int, default=512, help="Train steps per env step ratio (as in DreamerV3)")
     parser.add_argument("--prefill", type=int, default=5000, help="Random steps before training starts")
+    parser.add_argument("--buffer_capacity", type=int, default=1_000_000, help="Replay buffer capacity in steps")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--food_reward", type=float, default=1.0, help="Reward per food eaten")
@@ -266,7 +267,7 @@ def main():
         resumed_env_steps, resumed_train_steps = agent.load(args.resume)
         print(f"Resumed from {args.resume} (env_steps={resumed_env_steps}, train_steps={resumed_train_steps})")
 
-    buffer = ReplayBuffer(capacity=1_000_000, seq_len=args.seq_len)
+    buffer = ReplayBuffer(capacity=args.buffer_capacity, seq_len=args.seq_len)
 
     # --- Prefill buffer ---
     print(f"Prefilling buffer with {args.prefill} steps of random actions...")
