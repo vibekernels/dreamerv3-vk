@@ -116,7 +116,7 @@ class AsyncCollector:
             for i in range(self.num_envs):
                 action_oh = np.zeros(self.action_dim, dtype=np.float32)
                 action_oh[actions[i]] = 1.0
-                obs_t = np.transpose(obs_all[i], (2, 0, 1)).astype(np.float32)
+                obs_t = np.transpose(obs_all[i], (2, 0, 1))
                 self._obs_bufs[i].append(obs_t)
                 self._act_bufs[i].append(action_oh)
 
@@ -169,7 +169,7 @@ def collect_random_episodes(reward_config: RewardConfig, action_dim: int, target
             action = env.action_space.sample()
             action_oh = np.zeros(action_dim, dtype=np.float32)
             action_oh[action] = 1.0
-            obs_list.append(np.transpose(obs, (2, 0, 1)).astype(np.float32))
+            obs_list.append(np.transpose(obs, (2, 0, 1)))
             act_list.append(action_oh)
             obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -196,7 +196,7 @@ def collect_episode(env: gym.Env, agent: DreamerV3Agent, action_dim: int) -> dic
         action = agent.act(obs, training=True)
         action_oh = np.zeros(action_dim, dtype=np.float32)
         action_oh[action] = 1.0
-        obs_list.append(np.transpose(obs, (2, 0, 1)).astype(np.float32))
+        obs_list.append(np.transpose(obs, (2, 0, 1)))
         act_list.append(action_oh)
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated

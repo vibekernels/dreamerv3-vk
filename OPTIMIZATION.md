@@ -145,6 +145,10 @@ Tested running the RSSM loop under `torch.amp.autocast(dtype=bfloat16)`. bfloat1
 
 Tested replacing `nn.GRUCell` with `F.linear`-based implementation for better torch.compile visibility. Result: 1117 ms vs 1064 ms — the fused C++ GRU kernel is still faster.
 
+### Pinned-memory replay buffer
+
+Implemented uint8 obs storage in replay buffer (4x memory savings) with pinned-memory allocation and `non_blocking=True` async DMA transfers. However, since obs are already transferred as uint8 (19.7 MB per batch), the transfer is fast enough that pinned memory gives only **1.02x** speedup on train_step. Kept the uint8 storage and pinned memory for the memory efficiency benefit, but the speed impact is negligible.
+
 ## Remaining time budget breakdown (RTX 4090, B=32, T=50)
 
 | Phase | Time | Notes |
@@ -192,16 +196,7 @@ The simplest option: reduce `--seq_len` from 50 to 25.
 
 Can be combined with any of the above approaches.
 
-### Approach 4: Pinned-memory replay buffer
-
-The profiler showed pageable HtoD transfers are still significant. Pre-allocating replay buffer storage in pinned (page-locked) memory would enable true async DMA transfers via `non_blocking=True`, overlapping data transfer with computation.
-
-- **Expected speedup**: ~1.1-1.2x end-to-end
-- **Effort**: Medium (replay buffer refactor)
-- **Risk**: Low (increases host memory usage, pinned memory is a limited resource)
-
 ## Recommended next steps
 
-1. **Pinned-memory replay buffer** — straightforward engineering, eliminates remaining HtoD bottleneck
-2. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
-3. **Linear recurrence** — biggest potential gain but requires architecture research
+1. **Reduce seq_len** — quick experiment to validate the speedup is worth the context tradeoff
+2. **Linear recurrence** — biggest potential gain but requires architecture research

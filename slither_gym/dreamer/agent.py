@@ -271,12 +271,13 @@ class DreamerV3Agent:
 
     def train_step(self, batch: dict[str, np.ndarray]) -> dict[str, float]:
         """One training step on a batch of sequences. Returns loss metrics."""
-        # Transfer obs as uint8 (4x smaller than float32) and cast on GPU.
-        # Remaining tensors are small enough that transfer cost is negligible.
-        obs = torch.from_numpy(batch["obs"]).to(self.device).float() / 255.0   # (B, T, 3, 64, 64)
-        actions = torch.from_numpy(batch["action"]).to(self.device)             # (B, T, A)
-        rewards = torch.from_numpy(batch["reward"]).to(self.device)             # (B, T)
-        conts = torch.from_numpy(batch["cont"]).to(self.device)                 # (B, T)
+        # Transfer using non_blocking=True for async DMA when data is in pinned memory.
+        # Obs transferred as uint8 (4x smaller), cast to float32 on GPU.
+        nb = self.device.type == "cuda"
+        obs = torch.from_numpy(batch["obs"]).to(self.device, non_blocking=nb).float() / 255.0
+        actions = torch.from_numpy(batch["action"]).to(self.device, non_blocking=nb)
+        rewards = torch.from_numpy(batch["reward"]).to(self.device, non_blocking=nb)
+        conts = torch.from_numpy(batch["cont"]).to(self.device, non_blocking=nb)
 
         B, T = obs.shape[:2]
 
