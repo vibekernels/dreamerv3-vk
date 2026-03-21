@@ -236,6 +236,8 @@ def main():
     parser.add_argument("--no_async", action="store_true", help="Disable async collection (use single env)")
     parser.add_argument("--rssm_type", type=str, default="gru", choices=["gru", "mamba"],
                         help="RSSM type: gru (default) or mamba (selective SSM)")
+    parser.add_argument("--grad_checkpoint", action="store_true",
+                        help="Enable gradient checkpointing (~10%% slower but ~40%% less VRAM)")
     args = parser.parse_args()
 
     # Setup
@@ -263,6 +265,7 @@ def main():
         use_amp=not args.no_amp,
         compile_models=False,  # disabled: incompatible with multi-thread inference
         rssm_type=args.rssm_type,
+        grad_checkpoint=args.grad_checkpoint,
     )
 
     resumed_env_steps = 0

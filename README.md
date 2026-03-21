@@ -60,6 +60,7 @@ python train.py --device cpu --steps 6000 --prefill 1000 --train_ratio 32 --batc
 | `--no_async` | — | Disable async collection (single env) |
 | `--no_amp` | — | Disable mixed precision (bf16) |
 | `--rssm_type` | `gru` | RSSM backend: `gru` or `mamba` (parallel scan SSM) |
+| `--grad_checkpoint` | — | Trade ~10% speed for ~40% less VRAM (enables B=512+) |
 | `--food_reward` | 1.5 | Reward per food eaten |
 | `--kill_reward` | 10.0 | Reward per kill |
 | `--death_scale` | 0.1 | Death penalty = −death_scale × snake length |

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Independent, Normal, OneHotCategorical
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 class RSSMState(NamedTuple):
@@ -35,15 +36,14 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 
 
 def twohot_encode(x: torch.Tensor, num_bins: int = 255, low: float = -20.0, high: float = 20.0) -> torch.Tensor:
-    """Encode scalar values as two-hot vectors over a symlog-spaced grid."""
-    bins = torch.linspace(low, high, num_bins, device=x.device)
+    """Encode scalar values as two-hot vectors over a uniform grid."""
     x = x.clamp(low, high)
-    # Find bin indices
-    below = (x.unsqueeze(-1) >= bins).sum(-1) - 1
-    below = below.clamp(0, num_bins - 2)
+    # Direct bin index computation (uniform grid: no search needed)
+    step = (high - low) / (num_bins - 1)
+    below = ((x - low) / step).long().clamp(0, num_bins - 2)
     above = below + 1
     # Interpolation weights
-    weight_above = (x - bins[below]) / (bins[above] - bins[below] + 1e-8)
+    weight_above = (x - (low + below * step)) / step
     weight_above = weight_above.clamp(0, 1)
     weight_below = 1 - weight_above
     # Two-hot
@@ -53,9 +53,15 @@ def twohot_encode(x: torch.Tensor, num_bins: int = 255, low: float = -20.0, high
     return result
 
 
+_twohot_bins_cache: dict[tuple, torch.Tensor] = {}
+
 def twohot_decode(logits: torch.Tensor, num_bins: int = 255, low: float = -20.0, high: float = 20.0) -> torch.Tensor:
     """Decode two-hot logits to scalar values."""
-    bins = torch.linspace(low, high, num_bins, device=logits.device)
+    key = (num_bins, low, high, logits.device)
+    bins = _twohot_bins_cache.get(key)
+    if bins is None:
+        bins = torch.linspace(low, high, num_bins, device=logits.device)
+        _twohot_bins_cache[key] = bins
     probs = F.softmax(logits, dim=-1)
     return (probs * bins).sum(-1)
 
@@ -99,10 +105,14 @@ class CNNEncoder(nn.Module):
         self.flat_dim = depth * 8 * 4 * 4
         self.fc = nn.Linear(self.flat_dim, out_dim)
         self.norm = LayerNormSiLU(out_dim)
+        self.use_checkpointing = False
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         # obs: (B, 3, 64, 64) float
-        x = self.convs(obs)
+        if self.use_checkpointing and self.training and torch.is_grad_enabled():
+            x = grad_checkpoint(self.convs, obs, use_reentrant=False)
+        else:
+            x = self.convs(obs)
         x = x.reshape(x.shape[0], -1)
         return self.norm(self.fc(x))
 
@@ -121,10 +131,13 @@ class CNNDecoder(nn.Module):
             nn.ConvTranspose2d(depth * 2, depth, 4, 2, 1), nn.SiLU(),
             nn.ConvTranspose2d(depth, 3, 4, 2, 1),  # -> 64x64x3, no activation (MSE loss)
         )
+        self.use_checkpointing = False
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         x = self.norm(self.fc(features))
         x = x.reshape(-1, self.depth * 8, 4, 4)
+        if self.use_checkpointing and self.training and torch.is_grad_enabled():
+            return grad_checkpoint(self.deconvs, x, use_reentrant=False)
         return self.deconvs(x)  # (B, 3, 64, 64)
 
 

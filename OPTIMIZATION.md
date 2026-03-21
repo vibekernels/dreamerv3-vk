@@ -323,6 +323,44 @@ The default entropy bonus of 3e-4 was too low for the 6-action Slither environme
 
 Added `torch.no_grad()` around slow_critic value computation. The slow critic is only used for lambda-return targets (detached), so its forward pass doesn't need gradient tracking.
 
+### 25. Compiled actor-critic forward+loss ✅
+
+Extracted critic and actor forward+loss into standalone functions (`_critic_forward`, `_actor_forward`) and compiled them with `torch.compile(mode="default")`. Marginal benefit (~0.1%) since the AC phase is only ~11% of total train_step time and individual ops are already well-fused.
+
+### 26. Vectorized slow critic EMA ✅
+
+Replaced per-parameter `lerp_` loop with `torch._foreach_lerp_()` — a single fused kernel call instead of one kernel per parameter. Saves ~1ms of kernel launch overhead.
+
+### 27. Optimized twohot_encode ✅
+
+Replaced O(B × num_bins) broadcast comparison `(x.unsqueeze(-1) >= bins).sum(-1)` with direct O(B) bin index computation using uniform grid arithmetic. Cached `twohot_decode` bins tensor.
+
+### 28. Uint8 GPU transfer ✅
+
+Transfer observations as uint8 (4x less PCIe bandwidth) and convert to float32 on GPU with `obs.float().div_(255.0)`. Also reduces GPU memory since intermediate float32 allocation happens on-demand rather than persisting from transfer.
+
+### 29. Gradient checkpointing (optional) ✅
+
+Added `use_checkpointing` flag to CNNEncoder and CNNDecoder. When enabled, conv layer activations are recomputed during backward instead of stored, reducing VRAM by ~40% at the cost of ~10% more compute. Enables B=512-640 on 32GB GPUs. Activated via `--grad_checkpoint` flag.
+
+Note: On RTX 5090 (32GB), B=384 without checkpointing (242 SPS, 31GB) is faster than B=512 with checkpointing (219 SPS, 31GB) because the training loop is memory-bandwidth bound, not compute bound.
+
+## Combined results (after optimizations 1-29)
+
+All measurements on RTX 5090 (32 GB GDDR7), Mamba RSSM, T=50, train_ratio=512.
+
+| Batch size | ms/step | Theoretical SPS | VRAM | Notes |
+|---|---|---|---|---|
+| 64 | 34.7 | 180 | 5.5 GB | |
+| 128 | 59.2 | 211 | 8.1 GB | |
+| 192 | 82.5 | 227 | 16.0 GB | |
+| **256** | **106.9** | **234** | **21.2 GB** | Best for 24GB GPUs |
+| **384** | **155.2** | **242** | **31.1 GB** | **Best for 32GB GPUs** |
+| 512 | 228.5 | 219 | 30.8 GB | Requires --grad_checkpoint |
+| 640 | 283.7 | 220 | 32.0 GB | Requires --grad_checkpoint |
+
+End-to-end SPS with 8 async envs: ~320-350 SPS at B=384.
+
 ## Remaining approaches
 
 ### Validate Mamba quality
@@ -332,3 +370,17 @@ Mamba has been validated at 100k steps on Slither-v0: episodes reach consistent 
 ### Multi-start imagination
 
 Currently imagination starts from only the final posterior state (step T). DreamerV3 starts from all T states, giving B×T starting states. This would increase actor-critic training diversity at the cost of T× more imagination compute. A practical compromise: sample a subset (e.g., 8 time steps per batch).
+
+### Theoretical limits
+
+At B=384, the train_step breaks down as:
+- WM backward: ~48% (~75ms) — dominant bottleneck
+- WM forward: ~31% (~48ms)
+- Actor-critic: ~11% (~17ms)
+- Overhead (clip+opt+ema+transfer): ~10% (~15ms)
+
+Current compute efficiency is ~0.1% — we're massively memory-bandwidth and kernel-launch bound, not FLOP bound. Realistic ceiling estimates:
+- 2x faster backward: ~295 SPS
+- CUDA graphs (−30% overhead): ~325 SPS
+- Both combined: ~400 SPS
+- Pure compute bound: ~200,000 SPS (unreachable)
