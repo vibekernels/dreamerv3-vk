@@ -512,7 +512,8 @@ class MambaRSSM(nn.Module):
         features = torch.cat([deter_all, stoch_flat], dim=-1)
 
         return (features, post_stochs, prior_logits,
-                deter_all[-1], post_stochs[-1], h_all[-1])
+                deter_all[-1], post_stochs[-1], h_all[-1],
+                deter_all, h_all)
 
     def get_prior_logits(self, deter: torch.Tensor) -> torch.Tensor:
         return self.prior_net(deter).reshape(-1, self.stoch_dim, self.class_size)

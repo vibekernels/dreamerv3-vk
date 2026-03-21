@@ -86,7 +86,8 @@ def _mamba_wm_forward(encoder, rssm, decoder, reward_head, continue_head,
 
     # RSSM observe (parallel scan)
     all_features, all_post_stochs, all_prior_logits, \
-        final_deter, final_stoch, final_ssm_h = rssm.observe_sequence(actions, embed)
+        final_deter, final_stoch, final_ssm_h, \
+        deter_all, h_all = rssm.observe_sequence(actions, embed)
 
     features = all_features.permute(1, 0, 2)  # (T, B, D) -> (B, T, D)
     feat_flat = features.reshape(B * T, -1)
@@ -116,7 +117,8 @@ def _mamba_wm_forward(encoder, rssm, decoder, reward_head, continue_head,
     loss = recon_loss + reward_loss + cont_loss + kl_scale * kl_loss
 
     return loss, recon_loss, reward_loss, cont_loss, kl_loss, \
-        final_deter, final_stoch, final_ssm_h
+        final_deter, final_stoch, final_ssm_h, \
+        deter_all, h_all, all_post_stochs
 
 
 def _observe_sequence(rssm, init_deter, init_stoch, actions, embed, T):
@@ -179,6 +181,7 @@ class DreamerV3Agent:
         compile_models: bool = True,
         rssm_type: str = "gru",
         grad_checkpoint: bool = False,
+        imagine_starts: int = 1,
     ):
         # TF32 gives ~1.5x matmul speedup on Ampere+ GPUs with negligible precision loss
         torch.set_float32_matmul_precision("high")
@@ -195,6 +198,7 @@ class DreamerV3Agent:
         self.reward_bins = reward_bins
         self.free_nats = free_nats
         self.kl_scale = kl_scale
+        self.imagine_starts = imagine_starts
 
         # Mixed precision
         self.use_amp = use_amp and self.device.type == "cuda"
@@ -447,7 +451,8 @@ class DreamerV3Agent:
             # Fuses forward and backward kernels for ~20% backward speedup.
             with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 loss, recon_loss, reward_loss, cont_loss, kl_loss, \
-                    final_deter, final_stoch, final_ssm_h = \
+                    final_deter, final_stoch, final_ssm_h, \
+                    deter_all, h_all, all_post_stochs = \
                     self._compiled_wm_forward(
                         self.world_model.encoder, self.world_model.rssm,
                         self.world_model.decoder, self.world_model.reward_head,
@@ -455,7 +460,13 @@ class DreamerV3Agent:
                         obs, actions, rewards, conts, B, T,
                         self.reward_bins, self.free_nats, self.kl_scale,
                     )
-            # Pack ssm_h into deter for imagination starting state
+            if self.imagine_starts > 1:
+                # Cache all T states for multi-start imagination
+                # deter_all: (T, B, D), h_all: (T, B, D, N), all_post_stochs: (T, B, S, C)
+                self._train_all_states = (
+                    deter_all.detach(), h_all.detach(), all_post_stochs.detach()
+                )
+            # Pack ssm_h into deter for imagination starting state (final state)
             packed_deter = torch.cat(
                 [final_deter, final_ssm_h.reshape(B, -1)], dim=-1
             )
@@ -528,13 +539,45 @@ class DreamerV3Agent:
         kl_per_step = torch.clamp(kl_per_step, min=self.free_nats)
         return kl_per_step.mean()
 
+    def _get_imagination_starts(self, B, T):
+        """Get starting states for imagination rollouts.
+
+        With imagine_starts=1 (default), uses only the final posterior state.
+        With imagine_starts=K, samples K random timesteps from the WM posterior,
+        giving K*B starting states for more diverse imagination (DreamerV3 paper).
+        """
+        K = self.imagine_starts
+
+        if K <= 1 or not hasattr(self, '_train_all_states') or self._train_all_states is None:
+            # Single start from final state
+            return self._train_state_cache, B
+
+        deter_all, h_all, stochs_all = self._train_all_states  # (T, B, ...)
+
+        # Sample K random timesteps (without replacement if K <= T)
+        indices = torch.randperm(T, device=deter_all.device)[:K]
+
+        # Gather selected timesteps: (K, B, ...)
+        sel_deter = deter_all[indices]     # (K, B, D)
+        sel_h = h_all[indices]             # (K, B, D, N)
+        sel_stoch = stochs_all[indices]    # (K, B, S, C)
+
+        # Reshape to (K*B, ...)
+        KB = K * B
+        deter_flat = sel_deter.reshape(KB, -1)
+        h_flat = sel_h.reshape(KB, sel_h.shape[-2], sel_h.shape[-1])
+        stoch_flat = sel_stoch.reshape(KB, sel_stoch.shape[-2], sel_stoch.shape[-1])
+
+        # Pack deter + ssm_h (same format as single-start)
+        packed_deter = torch.cat([deter_flat, h_flat.reshape(KB, -1)], dim=-1)
+        state = RSSMState(deter=packed_deter, stoch=stoch_flat)
+        return state, KB
+
     def _train_actor_critic(self, obs, actions, B, T):
         """Train actor and critic through imagination in the world model."""
-        # Reuse the final posterior state from world-model training instead of
-        # re-running the entire 50-step RSSM loop.  Falls back to full recomputation
-        # if the cache is unavailable.
+        # Get starting states (single or multi-start)
         if self._train_state_cache is not None:
-            state = self._train_state_cache
+            state, N_starts = self._get_imagination_starts(B, T)
         else:
             with torch.no_grad():
                 with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -544,7 +587,7 @@ class DreamerV3Agent:
 
                 rssm = self.world_model.rssm
                 if self._use_mamba:
-                    _, _, _, final_d, final_s, final_h = self._compiled_observe_seq(
+                    _, _, _, final_d, final_s, final_h, _, _ = self._compiled_observe_seq(
                         rssm, actions, embed
                     )
                     packed = torch.cat([final_d, final_h.reshape(B, -1)], dim=-1)
@@ -556,6 +599,7 @@ class DreamerV3Agent:
                         actions, embed, T
                     )
                     state = RSSMState(deter=final_d.detach(), stoch=final_s.detach())
+                N_starts = B
 
         # Imagine forward — actor learns through differentiable world model dynamics.
         # Entire H-step loop compiled as single graph (same technique as observe).
@@ -564,7 +608,7 @@ class DreamerV3Agent:
             state.deter, state.stoch,
             self.imagine_horizon, self.action_dim,
         )
-        # (H+1, B, D) -> (B, H+1, D) and (H, B, A) -> (B, H, A)
+        # (H+1, N, D) -> (N, H+1, D) and (H, N, A) -> (N, H, A)
         features_stack = features_stack.permute(1, 0, 2)
         actions_stack = actions_stack.permute(1, 0, 2)
 
@@ -574,21 +618,21 @@ class DreamerV3Agent:
                 feat_flat = features_stack[:, 1:].reshape(-1, features_stack.shape[-1])
                 reward_logits = self.world_model.reward_head(feat_flat)
                 imagined_rewards = symexp(twohot_decode(reward_logits, self.reward_bins))
-                imagined_rewards = imagined_rewards.reshape(B, self.imagine_horizon)
+                imagined_rewards = imagined_rewards.reshape(N_starts, self.imagine_horizon)
 
-                cont_logits = self.world_model.continue_head(feat_flat).reshape(B, self.imagine_horizon)
+                cont_logits = self.world_model.continue_head(feat_flat).reshape(N_starts, self.imagine_horizon)
                 imagined_conts = torch.sigmoid(cont_logits)
 
         # Critic values (detach: values are only used for advantages, not differentiated)
         with torch.no_grad():
             with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 values = self.critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
-                values = values.reshape(B, self.imagine_horizon + 1)
+                values = values.reshape(N_starts, self.imagine_horizon + 1)
 
         with torch.no_grad():
             with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 slow_values = self.slow_critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
-                slow_values = slow_values.reshape(B, self.imagine_horizon + 1)
+                slow_values = slow_values.reshape(N_starts, self.imagine_horizon + 1)
 
         # Compute lambda-returns
         lambda_returns = self._compute_lambda_returns(

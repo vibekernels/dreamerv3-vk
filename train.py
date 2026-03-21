@@ -238,6 +238,8 @@ def main():
                         help="RSSM type: gru (default) or mamba (selective SSM)")
     parser.add_argument("--grad_checkpoint", action="store_true",
                         help="Enable gradient checkpointing (~10%% slower but ~40%% less VRAM)")
+    parser.add_argument("--imagine_starts", type=int, default=1,
+                        help="Number of posterior timesteps to start imagination from (DreamerV3: all T)")
     args = parser.parse_args()
 
     # Setup
@@ -266,6 +268,7 @@ def main():
         compile_models=False,  # disabled: incompatible with multi-thread inference
         rssm_type=args.rssm_type,
         grad_checkpoint=args.grad_checkpoint,
+        imagine_starts=args.imagine_starts,
     )
 
     resumed_env_steps = 0
