@@ -27,7 +27,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 ```bash
 # GPU (recommended)
-python train.py --device cuda --steps 500000
+PYTHONUNBUFFERED=1 python train.py --device cuda --steps 500000 \
+    --food_reward 1.5 --kill_reward 10.0 --death_scale 0.1 --survival_bonus -0.005 \
+    --num_envs 12 2>&1 | tee runs/train.log
 
 # CPU (very slow, only for smoke-testing)
 python train.py --device cpu --steps 6000 --prefill 1000 --train_ratio 32 --batch_size 4 --seq_len 16
