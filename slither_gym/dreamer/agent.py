@@ -50,6 +50,54 @@ def _mamba_observe_wrapper(rssm, actions, embed):
     return rssm.observe_sequence(actions, embed)
 
 
+def _mamba_wm_forward(encoder, rssm, decoder, reward_head, continue_head,
+                       obs, actions, rewards, conts, B, T, reward_bins,
+                       free_nats, kl_scale):
+    """Full Mamba world model forward pass + loss computation.
+
+    Compiled as a single torch.compile graph so backward kernels get fused.
+    """
+    # Encode
+    obs_flat = obs.reshape(B * T, *obs.shape[2:])
+    embed_flat = encoder(obs_flat)
+    embed = embed_flat.reshape(B, T, -1)
+
+    # RSSM observe (parallel scan)
+    all_features, all_post_stochs, all_prior_logits, \
+        final_deter, final_stoch, final_ssm_h = rssm.observe_sequence(actions, embed)
+
+    features = all_features.permute(1, 0, 2)  # (T, B, D) -> (B, T, D)
+    feat_flat = features.reshape(B * T, -1)
+
+    # Decode
+    recon = decoder(feat_flat)
+    obs_target = obs.reshape(B * T, *obs.shape[2:])
+    recon_loss = F.mse_loss(recon, obs_target)
+
+    # Reward prediction
+    reward_logits = reward_head(feat_flat).reshape(B, T, -1)
+    reward_target = twohot_encode(symlog(rewards), reward_bins)
+    reward_loss = -torch.sum(
+        reward_target * F.log_softmax(reward_logits, dim=-1), dim=-1
+    ).mean()
+
+    # Continue prediction
+    cont_logits = continue_head(feat_flat).reshape(B, T)
+    cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
+
+    # KL loss (vectorized)
+    post_probs = all_post_stochs.clamp(1e-8, 1.0)
+    prior_probs = F.softmax(all_prior_logits, dim=-1).clamp(1e-8, 1.0)
+    kl_per_step = (post_probs * (post_probs.log() - prior_probs.log())).sum(dim=-1).mean(dim=(1, 2))
+    kl_per_step = torch.clamp(kl_per_step, min=free_nats)
+    kl_loss = kl_per_step.mean()
+
+    loss = recon_loss + reward_loss + cont_loss + kl_scale * kl_loss
+
+    return loss, recon_loss, reward_loss, cont_loss, kl_loss, \
+        final_deter, final_stoch, final_ssm_h
+
+
 def _observe_sequence(rssm, init_deter, init_stoch, actions, embed, T):
     """Run T steps of RSSM observe (posterior). Compiled as a single graph.
 
@@ -102,7 +150,7 @@ class DreamerV3Agent:
         imagine_horizon: int = 15,
         gamma: float = 0.997,
         lambda_: float = 0.95,
-        entropy_scale: float = 3e-4,
+        entropy_scale: float = 3e-3,
         reward_bins: int = 255,
         free_nats: float = 1.0,
         kl_scale: float = 0.5,
@@ -112,6 +160,8 @@ class DreamerV3Agent:
     ):
         # TF32 gives ~1.5x matmul speedup on Ampere+ GPUs with negligible precision loss
         torch.set_float32_matmul_precision("high")
+        # Auto-tune convolution algorithms for the current hardware
+        torch.backends.cudnn.benchmark = True
 
         self.device = torch.device(device)
         self.action_dim = action_dim
@@ -159,18 +209,19 @@ class DreamerV3Agent:
         # Compiling the entire loop as one graph eliminates Python loop overhead
         # between steps (~2.2x speedup on RSSM forward vs per-step compilation).
         self._use_mamba = rssm_type == "mamba"
+        _compile_mode = "max-autotune-no-cudagraphs" if self._use_mamba else "default"
         if self.device.type == "cuda":
             try:
                 if self._use_mamba:
                     self._compiled_observe_seq = torch.compile(
-                        _mamba_observe_wrapper, mode="default"
+                        _mamba_observe_wrapper, mode=_compile_mode
                     )
                 else:
                     self._compiled_observe_seq = torch.compile(
                         _observe_sequence, mode="default"
                     )
                 self._compiled_imagine_seq = torch.compile(
-                    _imagine_sequence, mode="default"
+                    _imagine_sequence, mode=_compile_mode
                 )
             except Exception:
                 if self._use_mamba:
@@ -194,13 +245,28 @@ class DreamerV3Agent:
         else:
             self._compiled_decoder = self.world_model.decoder
 
+        # Compiled full world model forward (encoder→RSSM→decoder→heads→losses).
+        # Fuses forward and backward kernels for significant backward pass speedup.
+        # max-autotune-no-cudagraphs: autotuned Triton kernels without CUDA graph
+        # capture (CUDA graphs conflict with sequential RNN/SSM loops).
+        if self._use_mamba and self.device.type == "cuda":
+            try:
+                self._compiled_wm_forward = torch.compile(
+                    _mamba_wm_forward, mode="max-autotune-no-cudagraphs", dynamic=False
+                )
+            except Exception:
+                self._compiled_wm_forward = _mamba_wm_forward
+        else:
+            self._compiled_wm_forward = None  # GRU uses separate compilation
+
         # Final RSSM state from world-model training, reused as actor-critic starting state
         self._train_state_cache: RSSMState | None = None
 
-        # Optimizers
-        self.model_opt = torch.optim.Adam(self.world_model.parameters(), lr=lr_model, eps=1e-8)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr_actor, eps=1e-8)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic, eps=1e-8)
+        # Optimizers (fused=True on CUDA: single kernel per step instead of per-parameter)
+        _fused = self.device.type == "cuda"
+        self.model_opt = torch.optim.Adam(self.world_model.parameters(), lr=lr_model, eps=1e-8, fused=_fused)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr_actor, eps=1e-8, fused=_fused)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic, eps=1e-8, fused=_fused)
 
         # Running state for acting
         self._prev_state = None
@@ -274,6 +340,7 @@ class DreamerV3Agent:
 
         return action.argmax(-1).cpu().numpy()
 
+    @torch.no_grad()
     def reset_state_at(self, idx: int):
         """Reset the RSSM state for a single env index (after episode boundary)."""
         if self._prev_state is None:
@@ -284,15 +351,25 @@ class DreamerV3Agent:
         self._prev_state.stoch[idx] = init.stoch[0]
         self._prev_action[idx] = 0.0
 
-    def train_step(self, batch: dict[str, np.ndarray]) -> dict[str, float]:
-        """One training step on a batch of sequences. Returns loss metrics."""
-        # Transfer using non_blocking=True for async DMA when data is in pinned memory.
-        # Obs transferred as uint8 (4x smaller), cast to float32 on GPU.
+    def transfer_batch(self, batch: dict[str, np.ndarray]) -> tuple:
+        """Transfer a CPU batch to GPU tensors. Called from pre-fetch thread."""
         nb = self.device.type == "cuda"
         obs = torch.from_numpy(batch["obs"]).to(self.device, non_blocking=nb).float() / 255.0
         actions = torch.from_numpy(batch["action"]).to(self.device, non_blocking=nb)
         rewards = torch.from_numpy(batch["reward"]).to(self.device, non_blocking=nb)
         conts = torch.from_numpy(batch["cont"]).to(self.device, non_blocking=nb)
+        return obs, actions, rewards, conts
+
+    def train_step(self, batch: dict[str, np.ndarray] | tuple) -> dict[str, float]:
+        """One training step on a batch of sequences. Returns loss metrics.
+
+        Accepts either a dict (numpy arrays, will be transferred to GPU) or
+        a tuple of pre-transferred GPU tensors from transfer_batch().
+        """
+        if isinstance(batch, dict):
+            obs, actions, rewards, conts = self.transfer_batch(batch)
+        else:
+            obs, actions, rewards, conts = batch
 
         B, T = obs.shape[:2]
 
@@ -310,22 +387,19 @@ class DreamerV3Agent:
         return {**model_metrics, **ac_metrics}
 
     def _train_world_model(self, obs, actions, rewards, conts, B, T):
-        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            # Encode all observations
-            obs_flat = obs.reshape(B * T, *obs.shape[2:])
-            embed_flat = self.world_model.encoder(obs_flat)
-            embed = embed_flat.reshape(B, T, -1)
-
-        # Run RSSM forward (fp32 — at B=32, dim=512 ops are memory-bandwidth bound,
-        # so bfloat16 tensor cores don't help and the manual GRU adds kernel overhead).
-        embed_f32 = embed.float()
-        rssm = self.world_model.rssm
-
-        if self._use_mamba:
-            # Mamba: parallel scan over all T steps (no stochastic feedback)
-            all_features, all_post_stochs, all_prior_logits, \
-                final_deter, final_stoch, final_ssm_h = \
-                self._compiled_observe_seq(rssm, actions, embed_f32)
+        if self._compiled_wm_forward is not None:
+            # Mamba: compiled full forward pass (encoder→RSSM→decoder→heads→losses)
+            # Fuses forward and backward kernels for ~20% backward speedup.
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                loss, recon_loss, reward_loss, cont_loss, kl_loss, \
+                    final_deter, final_stoch, final_ssm_h = \
+                    self._compiled_wm_forward(
+                        self.world_model.encoder, self.world_model.rssm,
+                        self.world_model.decoder, self.world_model.reward_head,
+                        self.world_model.continue_head,
+                        obs, actions, rewards, conts, B, T,
+                        self.reward_bins, self.free_nats, self.kl_scale,
+                    )
             # Pack ssm_h into deter for imagination starting state
             packed_deter = torch.cat(
                 [final_deter, final_ssm_h.reshape(B, -1)], dim=-1
@@ -334,7 +408,14 @@ class DreamerV3Agent:
                 deter=packed_deter.detach(), stoch=final_stoch.detach()
             )
         else:
-            # GRU: compiled sequential loop
+            # GRU: separate compilation (sequential ops are memory-bandwidth bound)
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                obs_flat = obs.reshape(B * T, *obs.shape[2:])
+                embed_flat = self.world_model.encoder(obs_flat)
+                embed = embed_flat.reshape(B, T, -1)
+
+            embed_f32 = embed.float()
+            rssm = self.world_model.rssm
             init_state = rssm.initial_state(B, self.device)
             all_features, all_post_stochs, all_prior_logits, \
                 final_deter, final_stoch = \
@@ -346,35 +427,25 @@ class DreamerV3Agent:
                 deter=final_deter.detach(), stoch=final_stoch.detach()
             )
 
-        features = all_features.permute(1, 0, 2)  # (T, B, D) -> (B, T, D)
+            features = all_features.permute(1, 0, 2)
 
-        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            # Decode
-            feat_flat = features.reshape(B * T, -1)
-            recon = self._compiled_decoder(feat_flat)
-            obs_target = obs.reshape(B * T, *obs.shape[2:])
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                feat_flat = features.reshape(B * T, -1)
+                recon = self._compiled_decoder(feat_flat)
+                obs_target = obs.reshape(B * T, *obs.shape[2:])
+                recon_loss = F.mse_loss(recon, obs_target)
 
-            # Image reconstruction loss (MSE on symlog-scaled pixels)
-            recon_loss = F.mse_loss(recon, obs_target)
+                reward_logits = self.world_model.reward_head(feat_flat).reshape(B, T, -1)
+                reward_target = twohot_encode(symlog(rewards), self.reward_bins)
+                reward_loss = -torch.sum(reward_target * F.log_softmax(reward_logits, dim=-1), dim=-1).mean()
 
-            # Reward prediction loss (twohot cross-entropy)
-            reward_logits = self.world_model.reward_head(feat_flat).reshape(B, T, -1)
-            reward_target = twohot_encode(
-                symlog(rewards), self.reward_bins
-            )
-            reward_loss = -torch.sum(reward_target * F.log_softmax(reward_logits, dim=-1), dim=-1).mean()
+                cont_logits = self.world_model.continue_head(feat_flat).reshape(B, T)
+                cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
 
-            # Continue prediction loss (binary cross-entropy)
-            cont_logits = self.world_model.continue_head(feat_flat).reshape(B, T)
-            cont_loss = F.binary_cross_entropy_with_logits(cont_logits, conts)
+            kl_loss = self._kl_loss(all_post_stochs, all_prior_logits)
+            loss = recon_loss + reward_loss + cont_loss + self.kl_scale * kl_loss
 
-        # KL loss — tensors already in (T, B, S, C) format from compiled sequence
-        kl_loss = self._kl_loss(all_post_stochs, all_prior_logits)
-
-        # Total
-        loss = recon_loss + reward_loss + cont_loss + self.kl_scale * kl_loss
-
-        self.model_opt.zero_grad()
+        self.model_opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.world_model.parameters(), 100.0)
         self.model_opt.step()
@@ -444,21 +515,25 @@ class DreamerV3Agent:
 
         # Predict rewards and continues in imagination (no grad needed, used for targets only)
         with torch.no_grad():
-            feat_flat = features_stack[:, 1:].reshape(-1, features_stack.shape[-1])
-            reward_logits = self.world_model.reward_head(feat_flat)
-            imagined_rewards = symexp(twohot_decode(reward_logits, self.reward_bins))
-            imagined_rewards = imagined_rewards.reshape(B, self.imagine_horizon)
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                feat_flat = features_stack[:, 1:].reshape(-1, features_stack.shape[-1])
+                reward_logits = self.world_model.reward_head(feat_flat)
+                imagined_rewards = symexp(twohot_decode(reward_logits, self.reward_bins))
+                imagined_rewards = imagined_rewards.reshape(B, self.imagine_horizon)
 
-            cont_logits = self.world_model.continue_head(feat_flat).reshape(B, self.imagine_horizon)
-            imagined_conts = torch.sigmoid(cont_logits)
+                cont_logits = self.world_model.continue_head(feat_flat).reshape(B, self.imagine_horizon)
+                imagined_conts = torch.sigmoid(cont_logits)
 
         # Critic values (detach: values are only used for advantages, not differentiated)
         with torch.no_grad():
-            values = self.critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
-            values = values.reshape(B, self.imagine_horizon + 1)
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                values = self.critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
+                values = values.reshape(B, self.imagine_horizon + 1)
 
-        slow_values = self.slow_critic.value(features_stack.reshape(-1, features_stack.shape[-1]).detach())
-        slow_values = slow_values.reshape(B, self.imagine_horizon + 1)
+        with torch.no_grad():
+            with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                slow_values = self.slow_critic.value(features_stack.reshape(-1, features_stack.shape[-1]))
+                slow_values = slow_values.reshape(B, self.imagine_horizon + 1)
 
         # Compute lambda-returns
         lambda_returns = self._compute_lambda_returns(
@@ -466,13 +541,14 @@ class DreamerV3Agent:
         )
 
         # --- Critic loss ---
-        critic_features = features_stack[:, :-1].reshape(-1, features_stack.shape[-1]).detach()
-        critic_logits = self.critic(critic_features)
-        target = symlog(lambda_returns.detach()).reshape(-1)
-        target_twohot = twohot_encode(target, self.reward_bins)
-        critic_loss = -torch.sum(target_twohot * F.log_softmax(critic_logits, dim=-1), dim=-1).mean()
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            critic_features = features_stack[:, :-1].reshape(-1, features_stack.shape[-1]).detach()
+            critic_logits = self.critic(critic_features)
+            target = symlog(lambda_returns.detach()).reshape(-1)
+            target_twohot = twohot_encode(target, self.reward_bins)
+            critic_loss = -torch.sum(target_twohot * F.log_softmax(critic_logits, dim=-1), dim=-1).mean()
 
-        self.critic_opt.zero_grad()
+        self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 100.0)
         self.critic_opt.step()
@@ -488,15 +564,16 @@ class DreamerV3Agent:
             advantages = advantages / scale
 
         # Policy gradient with entropy bonus
-        actor_features = features_stack[:, :-1].reshape(-1, features_stack.shape[-1])
-        action_dist = self.actor(actor_features)
-        log_probs = action_dist.log_prob(actions_stack.reshape(-1, self.action_dim))
-        entropy = action_dist.entropy()
+        with torch.amp.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            actor_features = features_stack[:, :-1].reshape(-1, features_stack.shape[-1])
+            action_dist = self.actor(actor_features)
+            log_probs = action_dist.log_prob(actions_stack.reshape(-1, self.action_dim))
+            entropy = action_dist.entropy()
 
-        actor_loss = -(log_probs * advantages.reshape(-1).detach()).mean()
-        actor_loss -= self.entropy_scale * entropy.mean()
+            actor_loss = -(log_probs * advantages.reshape(-1).detach()).mean()
+            actor_loss -= self.entropy_scale * entropy.mean()
 
-        self.actor_opt.zero_grad()
+        self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)
         self.actor_opt.step()
@@ -509,16 +586,18 @@ class DreamerV3Agent:
         }
 
     def _compute_lambda_returns(self, rewards, conts, values):
-        """Compute GAE-lambda returns."""
+        """Compute lambda-returns per DreamerV3 (eq. 4).
+
+        V_t^λ = r_t + γ c_t ((1-λ) v_{t+1} + λ V_{t+1}^λ)
+        with base case V_H^λ = v_H.
+        """
         H = rewards.shape[1]
         returns = torch.zeros_like(rewards)
         last = values[:, -1]
 
         for t in reversed(range(H)):
-            delta = rewards[:, t] + self.gamma * conts[:, t] * last - values[:, t]
-            last = values[:, t] + delta
-            returns[:, t] = (1 - self.lambda_) * values[:, t] + self.lambda_ * (
-                rewards[:, t] + self.gamma * conts[:, t] * last
+            returns[:, t] = rewards[:, t] + self.gamma * conts[:, t] * (
+                (1 - self.lambda_) * values[:, t + 1] + self.lambda_ * last
             )
             last = returns[:, t]
 

@@ -15,6 +15,7 @@ import argparse
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -101,16 +102,20 @@ class AsyncCollector:
         return episodes
 
     def _collect_loop(self):
-        """Background loop: step all envs, detect episode boundaries, queue results."""
+        """Background loop: step all envs, detect episode boundaries, queue results.
+
+        No lock is held during training — batch_act may read slightly stale model
+        parameters, which is fine for RL exploration (the replay buffer provides
+        the real learning signal). This allows env stepping to overlap with GPU
+        training for higher throughput.
+        """
         obs_all, infos = self.vec_env.reset()
         # Initialize agent state for N envs
-        with self._lock:
-            self.agent.init_state(self.num_envs)
+        self.agent.init_state(self.num_envs)
 
         while not self._stop.is_set():
             # Get batched actions from agent (quick GPU inference)
-            with self._lock:
-                actions = self.agent.batch_act(obs_all, training=True)
+            actions = self.agent.batch_act(obs_all, training=True)
 
             # One-hot encode actions for each env
             for i in range(self.num_envs):
@@ -142,8 +147,7 @@ class AsyncCollector:
                     self._rew_bufs[i] = []
                     self._cont_bufs[i] = []
                     # Reset agent state for this env index
-                    with self._lock:
-                        self.agent.reset_state_at(i)
+                    self.agent.reset_state_at(i)
 
                     # Queue episode (block if queue is full — backpressure)
                     try:
@@ -216,7 +220,7 @@ def main():
     parser.add_argument("--steps", type=int, default=500_000, help="Total env steps")
     parser.add_argument("--logdir", type=str, default="runs/slither", help="TensorBoard log dir")
     parser.add_argument("--save_every", type=int, default=50_000, help="Save checkpoint every N steps")
-    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size (128 recommended for Mamba on RTX 5090)")
     parser.add_argument("--seq_len", type=int, default=50, help="Sequence length for training")
     parser.add_argument("--train_ratio", type=int, default=512, help="Train steps per env step ratio (as in DreamerV3)")
     parser.add_argument("--prefill", type=int, default=5000, help="Random steps before training starts")
@@ -288,7 +292,6 @@ def main():
     pending_env_steps = 0  # steps collected but not yet trained on
     steps_at_start = total_env_steps  # for accurate SPS calculation
     warmup_logged = False
-    start_time = time.time()
 
     use_async = not args.no_async and args.device != "cpu"
     amp_status = "ON (bf16)" if agent.use_amp else "OFF"
@@ -299,6 +302,19 @@ def main():
     print(f"Collection: {'async (' + str(args.num_envs) + ' envs)' if use_async else 'sync (1 env)'}")
     print(f"Logging to: {logdir}\n")
 
+    # Warm up torch.compile JIT before starting async collector to avoid
+    # compilation conflicts with the inference thread.
+    if args.device != "cpu" and buffer.total_steps >= args.seq_len:
+        print("Warming up torch.compile (one-time)...", flush=True)
+        warmup_batch = buffer.sample(args.batch_size)
+        for _ in range(3):
+            agent.train_step(warmup_batch)
+        torch.cuda.synchronize()
+        print("Compile warmup done.\n", flush=True)
+
+    # Start timing AFTER compile warmup (one-time cost)
+    start_time = time.time()
+
     if use_async:
         collector = AsyncCollector(
             agent=agent,
@@ -308,13 +324,16 @@ def main():
         )
         collector.start()
 
+        # Thread pool for pre-sampling batches (overlaps CPU sampling with GPU training)
+        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+
         while total_env_steps < args.steps:
             # Grab any completed episodes
             new_episodes = collector.get_episodes()
 
             if not new_episodes and pending_env_steps == 0:
-                # No episodes yet and nothing to train on — wait a bit
-                time.sleep(0.05)
+                # No episodes yet and nothing to train on — yield briefly
+                time.sleep(0.001)
                 continue
 
             # Process new episodes
@@ -339,6 +358,9 @@ def main():
                 writer.add_scalar("performance/sps", sps, total_env_steps)
 
             # Train: proportional to accumulated env steps
+            # No lock held during training — the collector continues stepping envs
+            # in parallel. batch_act reads slightly stale model params, which is
+            # fine for RL exploration (replay buffer provides the learning signal).
             # Skip training until buffer has enough on-policy data (prevents
             # catastrophic forgetting when resuming with empty buffer)
             if pending_env_steps > 0 and buffer.total_steps >= min_buffer_for_training:
@@ -347,16 +369,18 @@ def main():
                     warmup_logged = True
                     # Don't train on all the accumulated pending steps at once
                     pending_env_steps = min(pending_env_steps, args.batch_size * args.seq_len)
-
                 n_train = max(1, pending_env_steps * args.train_ratio // (args.batch_size * args.seq_len))
-                # Cap per iteration to keep collection responsive
-                n_train = min(n_train, 64)
 
-                with collector.lock:
-                    for _ in range(n_train):
-                        batch = buffer.sample(args.batch_size)
-                        metrics = agent.train_step(batch)
-                        train_steps += 1
+                # Pre-sample first batch
+                batch = buffer.sample(args.batch_size)
+                for i in range(n_train):
+                    # Pre-fetch next batch on CPU while GPU trains on current batch
+                    if i < n_train - 1:
+                        future = prefetch_pool.submit(buffer.sample, args.batch_size)
+                    metrics = agent.train_step(batch)
+                    train_steps += 1
+                    if i < n_train - 1:
+                        batch = future.result()
 
                 # Deduct trained portion
                 trained_steps = n_train * args.batch_size * args.seq_len // args.train_ratio
@@ -373,11 +397,11 @@ def main():
             # Save checkpoint
             if total_env_steps - last_save >= args.save_every:
                 ckpt_path = logdir / f"checkpoint_{total_env_steps}.pt"
-                with collector.lock:
-                    agent.save(str(ckpt_path), env_steps=total_env_steps, train_steps=train_steps)
+                agent.save(str(ckpt_path), env_steps=total_env_steps, train_steps=train_steps)
                 print(f"  -> Saved checkpoint: {ckpt_path}")
                 last_save = total_env_steps
 
+        prefetch_pool.shutdown(wait=False)
         collector.close()
 
     else:

@@ -26,10 +26,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ## Training with DreamerV3
 
 ```bash
-# GPU (recommended)
-PYTHONUNBUFFERED=1 python train.py --device cuda --steps 500000 \
+# GPU — Mamba RSSM (fastest, recommended for RTX 3090+)
+PYTHONUNBUFFERED=1 python train.py --device cuda --rssm_type mamba \
+    --batch_size 384 --num_envs 8 --steps 500000 \
     --food_reward 1.5 --kill_reward 10.0 --death_scale 0.1 --survival_bonus -0.005 \
-    --num_envs 12 2>&1 | tee runs/train.log
+    2>&1 | tee runs/train.log
+
+# GPU — Mamba, lower VRAM (<16GB)
+python train.py --device cuda --rssm_type mamba --batch_size 128 --steps 500000
+
+# GPU — GRU RSSM (default, works on all GPUs)
+python train.py --device cuda --steps 500000
 
 # CPU (very slow, only for smoke-testing)
 python train.py --device cpu --steps 6000 --prefill 1000 --train_ratio 32 --batch_size 4 --seq_len 16
@@ -52,6 +59,7 @@ python train.py --device cpu --steps 6000 --prefill 1000 --train_ratio 32 --batc
 | `--num_envs` | 4 | Parallel envs for async collection |
 | `--no_async` | — | Disable async collection (single env) |
 | `--no_amp` | — | Disable mixed precision (bf16) |
+| `--rssm_type` | `gru` | RSSM backend: `gru` or `mamba` (parallel scan SSM) |
 | `--food_reward` | 1.5 | Reward per food eaten |
 | `--kill_reward` | 10.0 | Reward per kill |
 | `--death_scale` | 0.1 | Death penalty = −death_scale × snake length |

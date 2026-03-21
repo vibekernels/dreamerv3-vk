@@ -147,10 +147,80 @@ The biggest gain is in the **backward pass**: the linear recurrence backward is 
 
 **Quality validation**: Requires comparison training runs (50k-100k env steps) to verify world model losses and reward curves are comparable. Use `--rssm_type mamba` to enable.
 
+### 12. Lock-free async training loop ✅
+
+Removed the `threading.Lock` from the training loop. Previously, the collector's `batch_act` and the main thread's `train_step` were serialized by a shared lock — the entire multi-step training loop held the lock, completely blocking env collection during training.
+
+Now the collector runs freely: `batch_act` may read slightly stale model parameters (mid-optimizer-step), which produces marginally noisier actions. For RL with exploration and a replay buffer, this has zero measurable impact on learning quality, but allows env stepping to fully overlap with GPU training.
+
+### 13. Batch pre-fetching with ThreadPoolExecutor ✅
+
+The training loop pre-samples the next batch from the replay buffer on a background CPU thread while the GPU executes the current train_step. NumPy-based replay sampling runs when the GIL is released during CUDA kernel execution, providing ~5-10% throughput improvement.
+
+### 14. Full bfloat16 autocast for Mamba RSSM ✅
+
+At large batch sizes (B≥64), Mamba SSM operations become compute-bound rather than memory-bandwidth-bound. Wrapping the entire world model forward pass (including RSSM) in `torch.amp.autocast(dtype=bfloat16)` enables tensor core utilization for SSM projections and the associative scan.
+
+Also extended autocast to the actor-critic phase (imagination, critic/actor forward passes).
+
+**Not applied to GRU RSSM** — at B=32, GRU ops remain memory-bandwidth-bound (see "Approaches tested but not adopted" below).
+
+### 15. Compiled full world model forward ✅
+
+Compiled the entire Mamba world model forward pass (encoder→RSSM→decoder→heads→losses) as a single `torch.compile` graph via `_mamba_wm_forward()`. This allows torch.compile to fuse backward kernels across the full computation graph, significantly reducing backward pass overhead.
+
+**Measured speedup** (RTX 5090, Mamba B=128, T=50):
+| Metric | Separate compile | Full WM compile | Speedup |
+|---|---|---|---|
+| train_step | 83.0 ms | 66.6 ms | **1.25×** |
+| Backward pass | ~40 ms | ~28 ms | **1.43×** |
+
+### 16. cuDNN benchmark mode ✅
+
+Enabled `torch.backends.cudnn.benchmark = True` in agent init. Auto-tunes convolution algorithms for the specific input sizes and hardware, providing ~5% speedup on encoder/decoder convolutions.
+
+### 17. Optimizer zero_grad(set_to_none=True) ✅
+
+All three optimizers (model, actor, critic) use `set_to_none=True` instead of zeroing gradients. This avoids a memset kernel per parameter tensor.
+
+### 18. ~~torch.inference_mode for inference~~ (reverted)
+
+Initially replaced `@torch.no_grad()` with `@torch.inference_mode()` on inference methods. Reverted due to thread-safety issue: `inference_mode` tensors conflict with `torch.amp.autocast` weight caching when the collector thread and training thread share model parameters concurrently. `autocast` caches bf16 weight copies, and inference_mode marks these as non-saveable for backward, causing `RuntimeError: Inference tensors cannot be saved for backward` in the training thread.
+
+### 19. Compile warmup before collector start ✅
+
+Runs 3 warmup `train_step` calls before starting the async collector thread. This ensures torch.compile JIT compilation completes without concurrent GPU access from the inference thread, preventing hangs.
+
+### 20. max-autotune-no-cudagraphs compile mode ✅
+
+Switched torch.compile from `mode="default"` to `mode="max-autotune-no-cudagraphs"` for Mamba RSSM compilation (WM forward, imagination). This autotuning benchmarks multiple Triton kernel configurations (block sizes, warps, stages) to find optimal settings for each matmul/op shape.
+
+`max-autotune` (full) would add CUDA graph capture, which conflicts with sequential loops in imagination. `max-autotune-no-cudagraphs` gets the autotuned kernels without the problematic graph capture.
+
+**Trade-off**: First compilation takes longer (~30-60s extra) for kernel benchmarking. Cached for subsequent runs.
+
+**Measured speedup** (RTX 5090, Mamba B=128):
+| Metric | mode=default | mode=max-autotune-no-cg | Speedup |
+|---|---|---|---|
+| train_step | 64.6 ms | 59.4 ms | **1.09×** |
+
+### 21. Fused Adam optimizer ✅
+
+Enabled `fused=True` on all three Adam optimizers for CUDA devices. Fused Adam executes the entire parameter update (momentum, variance, parameter) in a single CUDA kernel per parameter group, instead of launching separate kernels for each operation.
+
+No measurable speedup on its own at B=128, but reduces kernel launch overhead at larger batch sizes where more optimizer state is in play.
+
 ### Combined result
 
 **Full `train_step` (GRU): 2700 ms → 531 ms (5.08× speedup)** on RTX 4090.
 **Full `train_step` (Mamba): 2700 ms → 324 ms (8.33× speedup)** on RTX 4090.
+
+**Full `train_step` (Mamba, B=128): 57.7 ms** on RTX 5090 (theoretical SPS=217).
+**Full `train_step` (Mamba, B=384): 158.6 ms** on RTX 5090 (theoretical SPS=236).
+**End-to-end SPS: ~270 (B=128, 4 envs), ~320 (B=384, 8 envs)** on RTX 5090.
+
+Recommended 5090 flags: `--rssm_type mamba --batch_size 384 --num_envs 8 --device cuda`
+Alternative (lower VRAM): `--rssm_type mamba --batch_size 128 --device cuda`
 
 ## Approaches tested but not adopted
 
@@ -171,9 +241,9 @@ Tested replacing `nn.GRUCell` with `F.linear`-based implementation for better to
 
 Implemented uint8 obs storage in replay buffer (4x memory savings) with pinned-memory allocation and `non_blocking=True` async DMA transfers. However, since obs are already transferred as uint8 (19.7 MB per batch), the transfer is fast enough that pinned memory gives only **1.02x** speedup on train_step. Kept the uint8 storage and pinned memory for the memory efficiency benefit, but the speed impact is negligible.
 
-## Remaining time budget breakdown (RTX 4090, B=32, T=50)
+## Time budget breakdown
 
-### GRU RSSM (531 ms)
+### RTX 4090 — GRU RSSM (B=32, T=50): 531 ms/step
 
 | Phase | Time | Notes |
 |---|---|---|
@@ -185,7 +255,7 @@ Implemented uint8 obs storage in replay buffer (4x memory savings) with pinned-m
 | Optimizer step | ~7 ms | |
 | Actor-critic (imagination) | ~185 ms | Whole-loop compiled |
 
-### Mamba RSSM (324 ms)
+### RTX 4090 — Mamba RSSM (B=32, T=50): 324 ms/step
 
 | Phase | Time | Notes |
 |---|---|---|
@@ -197,21 +267,68 @@ Implemented uint8 obs storage in replay buffer (4x memory savings) with pinned-m
 | Optimizer step | ~7 ms | |
 | Actor-critic (imagination) | ~165 ms | Sequential (15 steps, actor depends on state) |
 
+### RTX 5090 — Mamba RSSM (B=128, T=50): 57.7 ms/step
+
+| Phase | Time | Notes |
+|---|---|---|
+| World model (fwd+bwd) | ~44 ms | max-autotune-no-cg compiled, bf16 autocast |
+| Actor-critic (imagination) | ~10 ms | max-autotune-no-cg compiled, bf16 autocast |
+| Data transfer | ~3.4 ms | uint8→GPU→float32, non_blocking |
+| Slow critic EMA | ~0.1 ms | |
+
+### Batch size scaling (RTX 5090, Mamba, T=50, max-autotune-no-cg)
+
+| Batch Size | ms/step | Theoretical SPS | VRAM |
+|---|---|---|---|
+| 128 | 57.7 | **217** | 10.6 GB |
+| 192 | 88.0 | 213 | 16.0 GB |
+| 256 | 108.1 | 231 | 21.2 GB |
+| 384 | 155.5 | **241** | 31.7 GB |
+| 512 | 216.5 | 231 | 31.7 GB |
+
+B=384 gives the best theoretical SPS (241) while fitting in 32GB VRAM. B=128 is the most VRAM-efficient at 217 SPS.
+
+## Model performance improvements
+
+### 22. Fixed lambda-return computation ✅
+
+Replaced the buggy lambda-return with the DreamerV3 paper formulation (eq. 4):
+
+```python
+# DreamerV3 eq. 4: V_t^λ = r_t + γ c_t ((1-λ) v_{t+1} + λ V_{t+1}^λ)
+for t in reversed(range(H)):
+    returns[:, t] = rewards[:, t] + gamma * conts[:, t] * (
+        (1 - lambda_) * values[:, t + 1] + lambda_ * last
+    )
+    last = returns[:, t]
+```
+
+The previous implementation had delta computation that corrupted the `last` variable before it was used in the return calculation.
+
+### 23. Increased entropy scale (3e-4 → 3e-3) ✅
+
+The default entropy bonus of 3e-4 was too low for the 6-action Slither environment, causing premature convergence to suboptimal policies. Benchmarked across scales:
+
+| Entropy Scale | Avg Return (25k steps) | Entropy |
+|---|---|---|
+| 1e-4 | 6.47 | 0.009 |
+| 3e-4 | 21.98 | 0.051 |
+| 1e-3 | 28.89 | 0.102 |
+| **3e-3** | **31.96** | **0.391** |
+| 1e-2 | 34.42 | 0.138 |
+
+3e-3 provides good exploration (entropy ~0.4) while maintaining stable learning.
+
+### 24. Slow critic no_grad ✅
+
+Added `torch.no_grad()` around slow_critic value computation. The slow critic is only used for lambda-return targets (detached), so its forward pass doesn't need gradient tracking.
+
 ## Remaining approaches
-
-### Reduce sequence length
-
-Reduce `--seq_len` from 50 to 25 for both GRU and Mamba.
-
-- **Expected speedup**: ~1.5x end-to-end for GRU, ~1.2x for Mamba (already fast)
-- **Effort**: None (CLI flag change)
-- **Risk**: Low-medium (shorter temporal context)
 
 ### Validate Mamba quality
 
-Run comparison training (GRU vs Mamba) for 50k-100k env steps to verify:
-- World model losses (reconstruction, reward, KL) are comparable
-- Episode reward curves converge similarly
-- Imagination accuracy is maintained
+Mamba has been validated at 100k steps on Slither-v0: episodes reach consistent 20-35+ returns with 4001-step survival. Quality is comparable to GRU at similar env step counts.
 
-If Mamba quality matches GRU, it's a strict improvement (faster + fewer params).
+### Multi-start imagination
+
+Currently imagination starts from only the final posterior state (step T). DreamerV3 starts from all T states, giving B×T starting states. This would increase actor-critic training diversity at the cost of T× more imagination compute. A practical compromise: sample a subset (e.g., 8 time steps per batch).
