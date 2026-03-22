@@ -1,6 +1,6 @@
 # slither-gym
 
-A slither.io clone with high-performance RL training using PPO, a Cython vectorized engine, and CNN policies.
+A slither.io clone with high-performance RL training using PPO, a Cython vectorized engine, and CNN policies in the style of PufferLib.
 
 <div align="center">
 
