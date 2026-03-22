@@ -2,7 +2,11 @@
 
 A slither.io clone with high-performance RL training using PPO, a Cython vectorized engine, and CNN policies.
 
+<div align="center">
+
 https://github.com/user-attachments/assets/97f0c730-b386-4ec9-bb8e-436ed60ad44a
+
+</div>
 
 ## Overview
 
