@@ -2,6 +2,8 @@
 
 A slither.io clone with high-performance RL training using PPO, a Cython vectorized engine, and CNN policies.
 
+https://github.com/user-attachments/assets/97f0c730-b386-4ec9-bb8e-436ed60ad44a
+
 ## Overview
 
 - **Game**: Slither.io-style arena — snakes eat food to grow, boost to move faster (shedding mass), die on collision with other snakes or the arena boundary. 4 NPC bot snakes provide opponents.
